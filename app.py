@@ -33,7 +33,7 @@ st.markdown("""
         margin-bottom: 10px;
     }
 </style>
-""", unsafe_allow_allowed_html=True)
+""", unsafe_allow_html=True)
 
 if "pinnacle_snapshots" not in st.session_state:
     st.session_state["pinnacle_snapshots"] = {}
@@ -121,7 +121,7 @@ PASOS
      * Bonus de precisión: si TODOS los componentes anteriores están en su nivel máximo simultáneamente (5+ fuentes, divergencia <2%, liquidez Alta, frescura <15 min), +1 pt adicional.
      Suma total = Nivel de confianza (máximo 10). Solo calificar como pick final si el total es >=8 — lo cual, por diseño de esta fórmula, solo ocurre cuando casi todos los componentes están en su mejor nivel simultáneamente. Esto es intencional: refuerza que la mayoría de los días el resultado sea 0 picks.
      Mostrar el desglose completo de esta suma en el informe final (no solo el número), para que el usuario pueda auditar cómo se llegó a la confianza reportada.
-   - Indicador de liquidez (Alta/Media/Baja) — CALCULADO DIRECTAMENTE DEL JSON, sin fuente adicional. IMPORTANTE: Stake.com no tiene API pública oficial y Bet365 restringe el acceso a terceros — es NORMAL y ESPERADO que solo Pinnacle responda en la mayoría de las consultas; esto NO es una señal de mercado ilíquido, es una limitación structural de la fuente de datos. Regla ajustada:
+   - Indicador de liquidez (Alta/Media/Baja) — CALCULADO DIRECTAMENTE DEL JSON, sin fuente adicional. IMPORTANTE: Stake.com no tiene API pública oficial y Bet365 restringe el acceso a terceros — es NORMAL y ESPERADO que solo Pinnacle responda en la mayoría de las consultas; esto NO es una señal de mercado ilíquido, es una limitación estructural de la fuente de datos. Regla ajustada:
      * Alta: 3 bookmakers o más reportan el mercado en el JSON, con dispersión de probabilidad implícita entre ellos menor al 5%.
      * Media: 2 bookmakers reportan el mercado, O solo Pinnacle reporta pero el evento pertenece a una liga/torneo de primer nivel donde Pinnacle acepta límites altos por defecto (ej. MLB, NBA, NFL, NHL, ATP/WTA nivel principal, Champions League, ligas top europeas, Copa Libertadores/Sudamericana en fase avanzada) — el propio modelo de negocio de Pinnacle (límites altos, apuestas de sharps) ya actúa como filtro indirecto de liquidez real del mercado subyacente.
      * Baja: solo Pinnacle reporta Y el evento es de una liga/torneo menor, de bajo perfil o con escaso volumen conocido (ej. ligas menores, fases preliminares, torneos amateurs).
@@ -144,7 +144,7 @@ PASOS
 
 9. Staking
    - Banca fija de $50, apuesta única — no aplica Kelly fraccionario tradicional (diseñado para series repetidas).
-   - Indicar explíciamente si el edge/confianza justifica apostar el 100% de los $50, o si conviene apostar una porción menor (50–75%) dejando colchón, según solidez del pick.
+   - Indicar explícitamente si el edge/confianza justifica apostar el 100% de los $50, o si conviene apostar una porción menor (50–75%) dejando colchón, según solidez del pick.
    - Justificar la recomendación de stake con una frase breve.
 
 10. Gestión de banca y continuidad
