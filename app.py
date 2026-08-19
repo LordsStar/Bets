@@ -21,7 +21,7 @@ METODOLOGÍA Y REGLAS CLAVE:
 """
 
 # ==============================================================================
-# 2. FUNCIONES BACKEND CON CACHÉ Y FILTRADO
+# 2. FUNCIONES BACKEND CON CACHÉ Y FILTRADO PRECISO
 # ==============================================================================
 
 @st.cache_data(ttl=3600)
@@ -87,20 +87,21 @@ def calcular_dispersion_mercado(evento):
         return 0.0
     return max(probs_home) - min(probs_home)
 
-def registrar_y_calcular_movimientos(eventos_minificados, deporte_key):
-    """Detecta cambios de cuota en Pinnacle mediante st.session_state sobre datos minificados."""
-    if not eventos_minificados:
+def registrar_y_calcular_movimientos(eventos_optimizados, deporte_key):
+    """Detecta cambios de cuota en Pinnacle mediante st.session_state sobre cuotas extraídas."""
+    if not eventos_optimizados:
         return {}
     state_key = f"pinnacle_snapshot_{deporte_key}"
     movimientos = {}
     snapshot_actual = {}
 
-    for ev in eventos_minificados:
+    for ev in eventos_optimizados:
         if not isinstance(ev, dict):
             continue
         ev_id = ev.get("id")
         matchup = ev.get("partido")
-        prices = ev.get("cuotas_pinnacle", {})
+        # Extraer cuotas de Pinnacle del dict condensado
+        prices = ev.get("cuotas_casas", {}).get("Pinnacle", {})
 
         if ev_id and prices:
             snapshot_actual[ev_id] = {
@@ -127,8 +128,8 @@ def registrar_y_calcular_movimientos(eventos_minificados, deporte_key):
 
 def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
     """
-    Filtra eventos de las próximas 24 horas, rango de cuota 1.40-2.00
-    y genera un JSON minificado optimizado para ahorrar tokens en la IA.
+    Filtra eventos de las próximas 24 horas y empaqueta TODAS las cuotas por casa 
+    de forma condensada para permitir el cálculo exacto de +EV sin saturar tokens.
     """
     if not datos_crudos or not isinstance(datos_crudos, list):
         return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
@@ -145,7 +146,7 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
         if not isinstance(evento, dict):
             continue
 
-        # 1. Filtro de Fecha: Únicamente partidos de las próximas 24 horas
+        # 1. Filtro estricto de Fecha (Próximas 24 horas)
         commence_str = evento.get("commence_time")
         if commence_str:
             try:
@@ -161,19 +162,33 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
             descartados_sin_pinnacle += 1
             continue
 
-        h2h = next((m for m in pinnacle.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
-        if not h2h:
+        h2h_pinnacle = next((m for m in pinnacle.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        if not h2h_pinnacle:
             descartados_sin_pinnacle += 1
             continue
 
-        outcomes = h2h.get("outcomes", [])
-        en_rango = any(1.40 <= o.get("price", 0) <= 2.00 for o in outcomes if isinstance(o, dict))
+        outcomes_pinnacle = h2h_pinnacle.get("outcomes", [])
+        en_rango = any(1.40 <= o.get("price", 0) <= 2.00 for o in outcomes_pinnacle if isinstance(o, dict))
         if not en_rango:
             descartados_fuera_de_rango += 1
             continue
 
-        # Cálculos del backend
-        pinnacle_devig = devig_probabilidades(outcomes)
+        # Extraer cuotas limpias de TODAS las casas de apuestas (Pinnacle, Bet365, Stake, BetOnline)
+        cuotas_todas_casas = {}
+        for b in evento.get("bookmakers", []):
+            if not isinstance(b, dict):
+                continue
+            nombre_casa = b.get("title") or b.get("key")
+            h2h = next((m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+            if h2h:
+                cuotas_todas_casas[nombre_casa] = {
+                    o.get("name"): o.get("price") 
+                    for o in h2h.get("outcomes", []) 
+                    if isinstance(o, dict)
+                }
+
+        # Cálculos clave
+        pinnacle_devig = devig_probabilidades(outcomes_pinnacle)
         n_bookmakers = len(evento.get("bookmakers", []))
         dispersion = calcular_dispersion_mercado(evento)
 
@@ -184,21 +199,19 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
         else:
             liquidez = "Media/Baja — evaluar según categoría de liga"
 
-        cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
-
-        # 2. Minificación para reducir tamaño de Prompt
-        evento_minificado = {
+        # Estructura optimizada pero 100% precisa con cuotas de todos los bookmakers
+        evento_optimizado = {
             "id": evento.get("id"),
             "deporte": evento.get("sport_title") or evento.get("sport_key"),
             "partido": f"{evento.get('home_team')} vs {evento.get('away_team')}",
             "inicio_utc": commence_str,
-            "cuotas_pinnacle": cuotas_pinnacle,
             "_pinnacle_devig": pinnacle_devig,
             "_pinnacle_last_update": pinnacle.get("last_update"),
-            "_liquidez_backend": liquidez
+            "_liquidez_backend": liquidez,
+            "cuotas_casas": cuotas_todas_casas  # Permite comparar Bet365/Stake/BetOnline vs Pinnacle
         }
 
-        eventos_validos.append(evento_minificado)
+        eventos_validos.append(evento_optimizado)
 
     resumen_filtro = (
         f"Backend pre-filtró {len(datos_crudos)} eventos: "
@@ -280,8 +293,8 @@ if api_key:
                         f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
                         f"RESUMEN DE PRE-FILTRADO:\n{resumen_filtro}\n\n"
                         f"{seccion_movimiento}\n\n"
-                        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, `_pinnacle_last_update` "
-                        f"y `_liquidez_backend`. No recalcules el de-vig ni filtres por rango nuevamente.\n\n"
+                        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, `_pinnacle_last_update`, "
+                        f"`_liquidez_backend` y compara los precios en `cuotas_casas`. No recalcules el de-vig ni filtres por rango nuevamente.\n\n"
                         f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS:\n"
                         f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
                     )
