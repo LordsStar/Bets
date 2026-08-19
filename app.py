@@ -21,11 +21,12 @@ METODOLOGÍA Y REGLAS CLAVE:
 """
 
 # ==============================================================================
-# 2. FUNCIONES BACKEND OPTIMIZADAS
+# 2. FUNCIONES BACKEND CON CACHÉ Y FILTRADO
 # ==============================================================================
 
+@st.cache_data(ttl=3600)
 def obtener_deportes_activos(api_key):
-    """Obtiene la lista completa de deportes activos hoy en The Odds API."""
+    """Obtiene la lista completa de deportes activos hoy en The Odds API guardando en caché por 1 hora."""
     url = f"https://api.the-odds-api.com/v4/sports/?apiKey={api_key}"
     try:
         response = requests.get(url, timeout=10)
@@ -35,8 +36,9 @@ def obtener_deportes_activos(api_key):
         st.error(f"Error al obtener deportes desde la API: {e}")
         return []
 
+@st.cache_data(ttl=1800)
 def obtener_cuotas_api(api_key, sport_key):
-    """Consulta cuotas para un deporte específico."""
+    """Consulta cuotas para un deporte específico utilizando caché por 30 min (protege tus créditos)."""
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {
         "apiKey": api_key,
@@ -143,7 +145,7 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
         if not isinstance(evento, dict):
             continue
 
-        # 1. Filtro estricto por Fecha (Próximas 24 horas)
+        # 1. Filtro de Fecha: Únicamente partidos de las próximas 24 horas
         commence_str = evento.get("commence_time")
         if commence_str:
             try:
@@ -170,7 +172,7 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
             descartados_fuera_de_rango += 1
             continue
 
-        # Cálculo de métricas
+        # Cálculos del backend
         pinnacle_devig = devig_probabilidades(outcomes)
         n_bookmakers = len(evento.get("bookmakers", []))
         dispersion = calcular_dispersion_mercado(evento)
@@ -184,7 +186,7 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
 
         cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
 
-        # 2. Minificación del Payload (Elimina bookmakers redundantes para el Prompt)
+        # 2. Minificación para reducir tamaño de Prompt
         evento_minificado = {
             "id": evento.get("id"),
             "deporte": evento.get("sport_title") or evento.get("sport_key"),
@@ -237,7 +239,7 @@ if api_key:
         deporte_key_seleccionado = opciones_deporte[seleccion]
 
         if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
-            with st.spinner("Consultando The Odds API y procesando pre-filtros..."):
+            with st.spinner("Consultando The Odds API (o usando caché) y procesando pre-filtros..."):
                 datos_acumulados = []
 
                 if deporte_key_seleccionado == "ALL":
