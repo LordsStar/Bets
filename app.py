@@ -21,7 +21,7 @@ METODOLOGÍA Y REGLAS CLAVE:
 """
 
 # ==============================================================================
-# 2. FUNCIONES DE API Y PRE-FILTRADO
+# 2. FUNCIONES BACKEND
 # ==============================================================================
 
 def obtener_deportes_activos(api_key):
@@ -30,16 +30,13 @@ def obtener_deportes_activos(api_key):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        # Filtra solo eventos activos y excluye apuestas futuras/outrights
-        deportes = [s for s in response.json() if s.get("active") and not s.get("has_outrights")]
-        return deportes
+        return [s for s in response.json() if s.get("active") and not s.get("has_outrights")]
     except Exception as e:
-        st.error(f"Error al obtener la lista de deportes desde The Odds API: {e}")
+        st.error(f"Error al obtener deportes desde la API: {e}")
         return []
 
-
 def obtener_cuotas_api(api_key, sport_key):
-    """Consulta las cuotas para un deporte específico."""
+    """Consulta cuotas para un deporte específico."""
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {
         "apiKey": api_key,
@@ -54,9 +51,8 @@ def obtener_cuotas_api(api_key, sport_key):
     except Exception:
         return []
 
-
 def devig_probabilidades(outcomes):
-    """Calcula probabilidades de-vigged normalizadas a 1.0."""
+    """Calcula probabilidades de-vigged normalizadas."""
     if not outcomes:
         return {}
     implicitas = {
@@ -68,7 +64,6 @@ def devig_probabilidades(outcomes):
     if overround == 0:
         return {}
     return {nombre: round(p / overround, 4) for nombre, p in implicitas.items()}
-
 
 def calcular_dispersion_mercado(evento):
     """Mide la dispersión de probabilidades entre casas de apuestas."""
@@ -89,7 +84,6 @@ def calcular_dispersion_mercado(evento):
     if len(probs_home) < 2:
         return 0.0
     return max(probs_home) - min(probs_home)
-
 
 def registrar_y_calcular_movimientos(eventos, deporte_key):
     """Detecta cambios de cuota en Pinnacle mediante st.session_state."""
@@ -129,11 +123,10 @@ def registrar_y_calcular_movimientos(eventos, deporte_key):
     st.session_state[state_key] = snapshot_actual
     return movimientos
 
-
 def filtrar_y_enriquecer(datos_crudos):
-    """Aplica la regla de cuota 1.40 - 2.00 y enriquece con de-vig."""
+    """Aplica la regla de cuota 1.40 - 2.00 y enriquece los eventos con de-vig y liquidez."""
     if not datos_crudos or not isinstance(datos_crudos, list):
-        return [], "Backend pre-filtró 0 eventos (no se recibieron datos válidos)."
+        return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
 
     eventos_validos = []
     descartados_sin_pinnacle = 0
@@ -176,25 +169,30 @@ def filtrar_y_enriquecer(datos_crudos):
         eventos_validos.append(evento_enriquecido)
 
     resumen_filtro = (
-        f"Backend pre-filtró {len(datos_crudos)} eventos totales procesados: "
-        f"{len(eventos_validos)} calificados (cuota Pinnacle 1.40-2.00), "
+        f"Backend pre-filtró {len(datos_crudos)} eventos: "
+        f"{len(eventos_validos)} candidatos calificados (cuota Pinnacle 1.40-2.00), "
         f"{descartados_sin_pinnacle} descartados sin Pinnacle, "
         f"{descartados_fuera_de_rango} descartados fuera de rango."
     )
     return eventos_validos, resumen_filtro
 
-
 # ==============================================================================
-# 3. INTERFAZ Y EJECUCIÓN EN STREAMLIT
+# 3. INTERFAZ DE USUARIO Y SELECCIÓN DE IA
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.0 (Multi-Deporte)")
+st.title("📊 Analista de Apuesta Única v3.0 (Multi-IA & Multi-Deporte)")
 
-# Gestión de API Key
-api_key = st.secrets.get("ODDS_API_KEY", "")
-if not api_key:
-    api_key = st.text_input("Ingresa tu Odds API Key:", type="password")
+# Configuración de API Keys
+with st.sidebar:
+    st.header("🔑 Configuración de APIs")
+    api_key = st.secrets.get("ODDS_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("Odds API Key:", type="password")
+    
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not gemini_api_key:
+        gemini_api_key = st.text_input("Gemini API Key (Opcional):", type="password")
 
 if api_key:
     deportes_lista = obtener_deportes_activos(api_key)
@@ -204,20 +202,18 @@ if api_key:
         for dep in deportes_lista:
             opciones_deporte[f"{dep.get('group')} - {dep.get('title')}"] = dep.get('key')
 
-        seleccion = st.selectbox("Selecciona el deporte o ámbito de análisis:", list(opciones_deporte.keys()))
+        seleccion = st.selectbox("Selecciona el deporte o ámbito a analizar:", list(opciones_deporte.keys()))
         deporte_key_seleccionado = opciones_deporte[seleccion]
 
-        if st.button("Ejecutar Análisis"):
-            with st.spinner("Consultando The Odds API y analizando mercados..."):
+        if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
+            with st.spinner("Consultando The Odds API y procesando pre-filtros..."):
                 datos_acumulados = []
 
                 if deporte_key_seleccionado == "ALL":
-                    # Iterar sobre todos los deportes activos
                     progress_bar = st.progress(0)
                     total_deps = len(deportes_lista)
                     for idx, dep in enumerate(deportes_lista):
-                        key = dep.get('key')
-                        cuotas = obtener_cuotas_api(api_key, key)
+                        cuotas = obtener_cuotas_api(api_key, dep.get('key'))
                         if cuotas:
                             datos_acumulados.extend(cuotas)
                         progress_bar.progress((idx + 1) / total_deps)
@@ -225,11 +221,9 @@ if api_key:
                 else:
                     datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado)
 
-                # Hora de Santo Domingo UTC-4
                 tz_rd = timezone(timedelta(hours=-4))
                 hora_rd = datetime.now(tz_rd).strftime("%Y-%m-%d %H:%M:%S AST (UTC-4)")
 
-                # Filtrado y movimientos
                 eventos_filtrados, resumen_filtro = filtrar_y_enriquecer(datos_acumulados)
                 movimientos_pinnacle = registrar_y_calcular_movimientos(eventos_filtrados, deporte_key_seleccionado)
 
@@ -238,7 +232,7 @@ if api_key:
                     lineas_mov = "\n".join(f"- {k}: {v}" for k, v in movimientos_pinnacle.items())
                     seccion_movimiento = f"MOVIMIENTOS EN PINNACLE DETECTADOS:\n{lineas_mov}"
 
-                st.write("### Resultado del Procesamiento de Datos")
+                st.write("### 📌 Resumen de Filtrado Backend")
                 st.info(resumen_filtro)
 
                 if not eventos_filtrados:
@@ -259,9 +253,44 @@ if api_key:
                         f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
                     )
 
+                    st.session_state["prompt_generado"] = prompt_completo
                     st.success(f"✅ Se consolidaron {len(eventos_filtrados)} eventos aptos para el prompt.")
-                    
-                    with st.expander("Ver Prompt completo enviado al LLM"):
-                        st.code(prompt_completo, language="text")
-    else:
-        st.error("No se pudieron cargar los deportes activos. Verifica que tu API Key sea correcta.")
+
+    # ==============================================================================
+    # 4. BOTONES PARA ABRIR Y EJECUTAR EN CADA IA ( RESTAURADOS )
+    # ==============================================================================
+    if "prompt_generado" in st.session_state:
+        st.divider()
+        st.subheader("🤖 Selecciona la IA para ejecutar el Análisis")
+
+        # Botones directos a las plataformas web de IA
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.link_button("🌐 Abrir ChatGPT", "https://chatgpt.com", use_container_width=True)
+        with col2:
+            st.link_button("🌐 Abrir Claude", "https://claude.ai", use_container_width=True)
+        with col3:
+            st.link_button("🌐 Abrir Gemini Web", "https://gemini.google.com", use_container_width=True)
+        with col4:
+            st.link_button("🌐 Abrir DeepSeek", "https://chat.deepseek.com", use_container_width=True)
+
+        # Muestra el Prompt generado con botón nativo de copia
+        st.write("#### 📋 Prompt Listo para Copiar")
+        st.code(st.session_state["prompt_generado"], language="markdown")
+
+        # Ejecución directa vía API en la app si se ingresó Gemini API Key
+        if gemini_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Google Gemini API)")
+            if st.button("🤖 Analizar directamente con Gemini API", type="primary"):
+                with st.spinner("Gemini está analizando las apuestas con la metodología Blindada v3.0..."):
+                    try:
+                        import google.generativeai as genai
+                        genai.configure(api_key=gemini_api_key)
+                        model = genai.GenerativeModel("gemini-1.5-pro")
+                        response = model.generate_content(st.session_state["prompt_generado"])
+                        st.markdown("### 🏆 Resultado del Análisis")
+                        st.markdown(response.text)
+                    except Exception as e:
+                        st.error(f"Error al ejecutar con Gemini API: {e}")
