@@ -21,7 +21,7 @@ METODOLOGÍA Y REGLAS CLAVE:
 """
 
 # ==============================================================================
-# 2. FUNCIONES BACKEND
+# 2. FUNCIONES BACKEND OPTIMIZADAS
 # ==============================================================================
 
 def obtener_deportes_activos(api_key):
@@ -85,26 +85,26 @@ def calcular_dispersion_mercado(evento):
         return 0.0
     return max(probs_home) - min(probs_home)
 
-def registrar_y_calcular_movimientos(eventos, deporte_key):
-    """Detecta cambios de cuota en Pinnacle mediante st.session_state."""
-    if not eventos:
+def registrar_y_calcular_movimientos(eventos_minificados, deporte_key):
+    """Detecta cambios de cuota en Pinnacle mediante st.session_state sobre datos minificados."""
+    if not eventos_minificados:
         return {}
     state_key = f"pinnacle_snapshot_{deporte_key}"
     movimientos = {}
     snapshot_actual = {}
 
-    for ev in eventos:
+    for ev in eventos_minificados:
         if not isinstance(ev, dict):
             continue
         ev_id = ev.get("id")
-        pinnacle = next((b for b in ev.get("bookmakers", []) if isinstance(b, dict) and b.get("key") == "pinnacle"), None)
-        if pinnacle:
-            h2h = next((m for m in pinnacle.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
-            if h2h:
-                snapshot_actual[ev_id] = {
-                    "matchup": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                    "prices": {o["name"]: o["price"] for o in h2h.get("outcomes", []) if isinstance(o, dict) and o.get("price")}
-                }
+        matchup = ev.get("partido")
+        prices = ev.get("cuotas_pinnacle", {})
+
+        if ev_id and prices:
+            snapshot_actual[ev_id] = {
+                "matchup": matchup,
+                "prices": prices
+            }
 
     if state_key in st.session_state and isinstance(st.session_state[state_key], dict):
         snapshot_previo = st.session_state[state_key]
@@ -123,18 +123,36 @@ def registrar_y_calcular_movimientos(eventos, deporte_key):
     st.session_state[state_key] = snapshot_actual
     return movimientos
 
-def filtrar_y_enriquecer(datos_crudos):
-    """Aplica la regla de cuota 1.40 - 2.00 y enriquece los eventos con de-vig y liquidez."""
+def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
+    """
+    Filtra eventos de las próximas 24 horas, rango de cuota 1.40-2.00
+    y genera un JSON minificado optimizado para ahorrar tokens en la IA.
+    """
     if not datos_crudos or not isinstance(datos_crudos, list):
         return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
 
     eventos_validos = []
     descartados_sin_pinnacle = 0
     descartados_fuera_de_rango = 0
+    descartados_fecha = 0
+
+    ahora_utc = datetime.now(timezone.utc)
+    limite_utc = ahora_utc + timedelta(hours=horas_ventana)
 
     for evento in datos_crudos:
         if not isinstance(evento, dict):
             continue
+
+        # 1. Filtro estricto por Fecha (Próximas 24 horas)
+        commence_str = evento.get("commence_time")
+        if commence_str:
+            try:
+                commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+                if not (ahora_utc <= commence_dt <= limite_utc):
+                    descartados_fecha += 1
+                    continue
+            except Exception:
+                pass
 
         pinnacle = next((b for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key") == "pinnacle"), None)
         if not pinnacle:
@@ -152,25 +170,38 @@ def filtrar_y_enriquecer(datos_crudos):
             descartados_fuera_de_rango += 1
             continue
 
-        evento_enriquecido = dict(evento)
-        evento_enriquecido["_pinnacle_devig"] = devig_probabilidades(outcomes)
-        evento_enriquecido["_pinnacle_last_update"] = pinnacle.get("last_update")
-
+        # Cálculo de métricas
+        pinnacle_devig = devig_probabilidades(outcomes)
         n_bookmakers = len(evento.get("bookmakers", []))
         dispersion = calcular_dispersion_mercado(evento)
 
         if n_bookmakers >= 3 and dispersion < 0.05:
-            evento_enriquecido["_liquidez_backend"] = "Alta"
+            liquidez = "Alta"
         elif n_bookmakers >= 2:
-            evento_enriquecido["_liquidez_backend"] = "Media"
+            liquidez = "Media"
         else:
-            evento_enriquecido["_liquidez_backend"] = "Media/Baja — evaluar según categoría de liga"
+            liquidez = "Media/Baja — evaluar según categoría de liga"
 
-        eventos_validos.append(evento_enriquecido)
+        cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
+
+        # 2. Minificación del Payload (Elimina bookmakers redundantes para el Prompt)
+        evento_minificado = {
+            "id": evento.get("id"),
+            "deporte": evento.get("sport_title") or evento.get("sport_key"),
+            "partido": f"{evento.get('home_team')} vs {evento.get('away_team')}",
+            "inicio_utc": commence_str,
+            "cuotas_pinnacle": cuotas_pinnacle,
+            "_pinnacle_devig": pinnacle_devig,
+            "_pinnacle_last_update": pinnacle.get("last_update"),
+            "_liquidez_backend": liquidez
+        }
+
+        eventos_validos.append(evento_minificado)
 
     resumen_filtro = (
         f"Backend pre-filtró {len(datos_crudos)} eventos: "
-        f"{len(eventos_validos)} candidatos calificados (cuota Pinnacle 1.40-2.00), "
+        f"{len(eventos_validos)} candidatos calificados (hoy / prx 24h, cuota 1.40-2.00), "
+        f"{descartados_fecha} descartados por fecha (eventos futuros), "
         f"{descartados_sin_pinnacle} descartados sin Pinnacle, "
         f"{descartados_fuera_de_rango} descartados fuera de rango."
     )
@@ -257,13 +288,12 @@ if api_key:
                     st.success(f"✅ Se consolidaron {len(eventos_filtrados)} eventos aptos para el prompt.")
 
     # ==============================================================================
-    # 4. BOTONES PARA ABRIR Y EJECUTAR EN CADA IA ( RESTAURADOS )
+    # 4. BOTONES PARA ABRIR Y EJECUTAR EN CADA IA
     # ==============================================================================
     if "prompt_generado" in st.session_state:
         st.divider()
         st.subheader("🤖 Selecciona la IA para ejecutar el Análisis")
 
-        # Botones directos a las plataformas web de IA
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -275,11 +305,9 @@ if api_key:
         with col4:
             st.link_button("🌐 Abrir DeepSeek", "https://chat.deepseek.com", use_container_width=True)
 
-        # Muestra el Prompt generado con botón nativo de copia
         st.write("#### 📋 Prompt Listo para Copiar")
         st.code(st.session_state["prompt_generado"], language="markdown")
 
-        # Ejecución directa vía API en la app si se ingresó Gemini API Key
         if gemini_api_key:
             st.divider()
             st.subheader("⚡ Ejecución Directa en App (Google Gemini API)")
