@@ -25,9 +25,18 @@ METODOLOGÍA Y REGLAS CLAVE:
 1. ANCLA OBLIGATORIA: Usa directamente el campo `_pinnacle_devig` que el backend ya
    calculó. No recalcules el de-vig.
 
-2. GATE DE FRESCURA: Revisa `_pinnacle_last_update`. Si la cuota de Pinnacle tiene
-   más de 60 minutos de antigüedad respecto a la hora de consulta, DESCARTA el
-   evento automáticamente y regístralo como "descartado por datos obsoletos".
+2. GATE DE FRESCURA (relativo al tiempo restante, NO un umbral fijo):
+   Pinnacle solo actualiza el precio cuando se mueve la línea. Si a un evento le
+   faltan muchas horas para empezar, es NORMAL que `_pinnacle_last_update` tenga
+   varias horas de antigüedad — eso NO es dato obsoleto, es un mercado tranquilo.
+   Compara `_pinnacle_last_update` contra `inicio_utc`, no contra la hora actual:
+   - Si al evento le faltan MENOS de 3 horas para empezar Y `_pinnacle_last_update`
+     tiene más de 90 minutos de antigüedad → sí es señal real de posible dato
+     desactualizado cerca del cierre del mercado → DESCARTA el evento.
+   - Si al evento le faltan MÁS de 3 horas, la antigüedad de `_pinnacle_last_update`
+     es solo informativa: NO descartes el evento por este motivo.
+   Registra en el resumen cuántos eventos cayeron específicamente por este gate
+   (distinto de "sin segundo modelo" o "fuera de umbral EV").
 
 3. VALIDACIÓN CRUZADA (Segundo Modelo) — fuente específica por deporte, NO genérica:
    - Fútbol (soccer): ClubElo (ratings Elo) o el modelo SPI/Elo de FiveThirtyEight
