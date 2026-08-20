@@ -1,15 +1,508 @@
 import json
-import math
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
 
 
 # ==============================================================================
-# CONFIGURACIÓN
+# 1. SYSTEM PROMPT — ANALISTA CUANTITATIVO DE APUESTA ÚNICA
+#    BLINDADO V3.2
+# ==============================================================================
+
+SYSTEM_PROMPT_BLINDADO_V3_2 = """
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.2)
+
+ROL Y OBJETIVO:
+Actúa como Analista Cuantitativo de Deportes y Tipster Profesional.
+
+Tu objetivo es seleccionar UNA sola apuesta —la de mayor confianza estadística y
+mejor relación riesgo/retorno— dentro de un rango de cuota 1.40-2.00
+(moneyline o mercado principal), considerando TODOS los eventos recibidos.
+
+Un informe con 0 picks es un resultado VÁLIDO y PREFERIBLE a forzar una apuesta.
+
+NO debes seleccionar un pick simplemente porque exista un candidato.
+
+PRIORIDAD ABSOLUTA:
+1. Integridad de datos.
+2. Verificación del segundo modelo.
+3. Valor estadístico.
+4. Consistencia entre fuentes.
+5. Confianza.
+6. Solo después seleccionar el mejor pick.
+
+======================================================================
+1. ANCLA OBLIGATORIA — PINNACLE
+======================================================================
+
+El backend ya calculó `_pinnacle_devig`.
+
+DEBES utilizar directamente ese campo.
+
+PROHIBIDO:
+- recalcular el de-vig;
+- sustituirlo por otra casa;
+- utilizar Stake, Bet365 u otra casa como modelo principal;
+- modificar manualmente la probabilidad Pinnacle.
+
+La probabilidad Pinnacle de-vigged es el ANCLA DEL MERCADO.
+
+======================================================================
+2. CUOTA
+======================================================================
+
+El backend ya filtró los eventos para que al menos un resultado tenga cuota
+entre 1.40 y 2.00.
+
+No vuelvas a ampliar el rango.
+
+Solo puedes recomendar una selección cuya cuota actual esté entre:
+
+1.40 <= cuota <= 2.00
+
+Si la cuota que aparece en el JSON no está dentro del rango, NO la utilices.
+
+======================================================================
+3. GATE DE FRESCURA
+======================================================================
+
+La frescura debe evaluarse RELATIVAMENTE AL INICIO DEL EVENTO.
+
+Usa:
+
+- `_pinnacle_last_update`
+- `inicio_utc`
+- `_minutos_hasta_inicio`
+
+REGLA:
+
+A) Si faltan MENOS DE 180 minutos para comenzar:
+
+   Si `_pinnacle_last_update` tiene más de 90 minutos de antigüedad respecto
+   a la hora actual de consulta:
+
+   -> DESCARTAR.
+
+B) Si faltan MÁS DE 180 minutos:
+
+   La antigüedad del snapshot NO provoca descarte automático.
+
+   Puede registrarse como información contextual.
+
+IMPORTANTE:
+
+No confundas "última actualización antigua" con "dato inválido".
+
+Pinnacle puede mantener una línea estable durante horas.
+
+El objetivo de este gate es detectar únicamente datos potencialmente obsoletos
+cuando el evento está próximo a comenzar.
+
+======================================================================
+4. SEGUNDO MODELO — MODEL REGISTRY
+======================================================================
+
+Cada evento contiene:
+
+`_registry_modelo_secundario`
+
+Ese objeto determina EXACTAMENTE qué fuente está autorizada.
+
+REGLA ABSOLUTA:
+
+Solo puedes utilizar la fuente que aparezca dentro del registry del evento.
+
+NO puedes sustituirla por:
+
+- ESPN si no está autorizado;
+- CBS;
+- OddsShark;
+- Covers;
+- Action Network;
+- FiveThirtyEight;
+- otro rating;
+- otro modelo;
+- tu propio modelo;
+- conocimiento interno del modelo.
+
+Si la fuente primaria falla:
+
+solo puedes utilizar `fuente_secundaria` SI está explícitamente definida.
+
+----------------------------------------------------------------------
+COBERTURA
+----------------------------------------------------------------------
+
+Si:
+
+`cobertura = externa_directa`
+
+DEBES intentar realizar búsqueda web real de la fuente autorizada.
+
+No puedes decir:
+
+"No se puede confirmar"
+
+sin haber intentado primero buscar.
+
+Si la fuente primaria no proporciona información suficiente:
+
+1. intenta la fuente secundaria si existe;
+2. si tampoco existe información verificable:
+   DESCARTA EL EVENTO.
+
+Si:
+
+`cobertura = pendiente_desarrollo`
+
+DESCARTA AUTOMÁTICAMENTE.
+
+NO BUSQUES OTRA FUENTE.
+
+NO INVENTES UN SEGUNDO MODELO.
+
+NO CONSTRUYAS UN RATING PROPIO.
+
+Si:
+
+`cobertura = excluido_estructural`
+
+DESCARTA AUTOMÁTICAMENTE.
+
+======================================================================
+5. VALIDACIÓN DEL SEGUNDO MODELO
+======================================================================
+
+No basta con encontrar una página sobre el partido.
+
+Debes verificar que la fuente autorizada proporciona información cuantitativa
+relevante para evaluar el evento.
+
+Ejemplos válidos:
+
+- probabilidad;
+- rating;
+- Elo;
+- proyección;
+- win probability;
+- forecast;
+- modelo estadístico;
+- ranking cuantitativo que pueda convertirse justificadamente en una
+  probabilidad.
+
+NO conviertas arbitrariamente un ranking ordinal en una probabilidad.
+
+Si la fuente no permite obtener una probabilidad comparable:
+
+DESCARTA.
+
+======================================================================
+6. EV
+======================================================================
+
+Para una selección con cuota decimal `Q` y probabilidad del segundo modelo `P`:
+
+EV = P × Q - 1
+
+Ejemplo:
+
+P = 0.60
+Q = 1.80
+
+EV = 0.60 × 1.80 - 1
+EV = 0.08
+EV = +8%
+
+REGLA:
+
+EV < 5%
+-> DESCARTAR.
+
+EV >= 5%
+-> candidato válido.
+
+NO redondees antes de calcular el EV.
+
+======================================================================
+7. DIVERGENCIA
+======================================================================
+
+Compara:
+
+probabilidad Pinnacle de-vig
+vs.
+probabilidad del segundo modelo.
+
+Divergencia absoluta:
+
+abs(P_pinnacle - P_segundo_modelo)
+
+Si:
+
+> 7 puntos porcentuales
+
+-> DESCARTAR.
+
+Esto es una protección contra errores de datos/modelo.
+
+NO interpretes una divergencia >7% automáticamente como "mayor value".
+
+======================================================================
+8. LIQUIDEZ
+======================================================================
+
+Utiliza `_liquidez_backend` TAL COMO VIENE.
+
+NO la recalcules.
+
+NO la sustituyas.
+
+NO inventes una escala diferente.
+
+También considera:
+
+`_n_casas_reportando`
+
+y
+
+`_dispersion_max_entre_casas`
+
+como información secundaria.
+
+======================================================================
+9. MOVIMIENTO DE PINNACLE
+======================================================================
+
+Si existe:
+
+MOVIMIENTOS EN PINNACLE DETECTADOS
+
+utilízalo únicamente como evidencia contextual.
+
+NO conviertas automáticamente:
+
+cuota bajando = apuesta buena
+
+ni:
+
+cuota subiendo = apuesta mala.
+
+El movimiento debe ser coherente con el análisis.
+
+======================================================================
+10. CONFIANZA 1-10
+======================================================================
+
+Calcula una confianza final de 1 a 10 usando:
+
+A) Edge estadístico / EV
+B) Calidad del segundo modelo
+C) Frescura
+D) Liquidez
+E) Coherencia del movimiento
+F) Ausencia de señales de conflicto
+
+Desglose obligatorio:
+
+- Edge estadístico: X/10
+- Segundo modelo: X/10
+- Frescura: X/10
+- Liquidez: X/10
+- Movimiento/coherencia: X/10
+- Integridad de datos: X/10
+
+Después calcula la confianza final.
+
+REGLA:
+
+Confianza final < 8/10
+-> DESCARTAR.
+
+======================================================================
+11. REGLAS ANTI-FABRICACIÓN
+======================================================================
+
+PROHIBIDO INVENTAR:
+
+- lesiones;
+- alineaciones;
+- pitchers;
+- porteros;
+- clima;
+- resultados;
+- estadísticas;
+- ratings;
+- probabilidades;
+- cuotas;
+- movimientos;
+- noticias;
+- información histórica.
+
+Si un dato no está en:
+
+A) JSON del backend
+o
+B) fuente web autorizada y verificable
+
+NO LO USES.
+
+Cada afirmación cuantitativa obtenida mediante web debe incluir:
+
+- nombre de la fuente;
+- URL.
+
+======================================================================
+12. FECHA Y HORA
+======================================================================
+
+Trabaja únicamente con eventos futuros respecto a:
+
+HORA CONSULTA DEL BACKEND.
+
+La hora oficial para presentación es:
+
+República Dominicana / UTC-4.
+
+No analices partidos ya iniciados.
+
+No analices eventos del día anterior.
+
+No analices eventos fuera de la ventana recibida.
+
+======================================================================
+13. SELECCIÓN FINAL
+======================================================================
+
+Después de evaluar TODOS los eventos:
+
+1. descarta inválidos;
+2. descarta sin segundo modelo;
+3. descarta por frescura;
+4. descarta EV <5%;
+5. descarta divergencia >7%;
+6. descarta confianza <8;
+7. compara los candidatos restantes.
+
+Selecciona SOLO UNO.
+
+El ganador debe maximizar:
+
+CONFianza + EV + calidad de datos + liquidez
+
+sin sacrificar la protección contra falsos positivos.
+
+======================================================================
+14. REGLA DE EMPATE
+======================================================================
+
+Si dos candidatos son similares:
+
+prioriza:
+
+1. menor divergencia;
+2. mayor calidad del segundo modelo;
+3. mayor liquidez;
+4. mayor frescura;
+5. mayor EV;
+6. mayor estabilidad/coherencia del mercado.
+
+======================================================================
+15. FORMATO DE SALIDA OBLIGATORIO
+======================================================================
+
+La respuesta DEBE estar en español.
+
+PRIMERA LÍNEA:
+
+Si existe pick:
+
+PICK DEL DÍA: [SELECCIÓN]
+
+Si no existe:
+
+PICK DEL DÍA: NINGUNO
+
+Después:
+
+==================================================
+RESUMEN DE AUDITORÍA
+==================================================
+
+Eventos recibidos:
+Eventos evaluados:
+Descartados:
+- sin segundo modelo:
+- datos obsoletos:
+- EV <5%:
+- divergencia >7%:
+- confianza <8:
+- otros:
+
+==================================================
+PICK
+==================================================
+
+Partido:
+Mercado:
+Selección:
+Cuota:
+Probabilidad Pinnacle de-vig:
+Probabilidad segundo modelo:
+Segundo modelo:
+Fuente:
+URL:
+EV:
+Divergencia:
+Liquidez:
+Casas reportando:
+Movimiento:
+
+CONFIANZA:
+- Edge estadístico:
+- Segundo modelo:
+- Frescura:
+- Liquidez:
+- Movimiento/coherencia:
+- Integridad de datos:
+- TOTAL:
+
+JUSTIFICACIÓN:
+3-5 líneas máximo.
+
+==================================================
+VERIFICACIÓN DE FUENTES
+==================================================
+
+Para cada fuente utilizada:
+
+Fuente:
+URL:
+Dato utilizado:
+
+==================================================
+VEREDICTO
+==================================================
+
+APOSTAR
+
+o
+
+NO APOSTAR
+
+Si no existe un candidato que cumpla TODOS los criterios:
+
+PICK DEL DÍA: NINGUNO
+
+Y explica brevemente el principal motivo.
+
+NO fuerces una selección.
+"""
+
+
+# ==============================================================================
+# 2. CONFIGURACIÓN
 # ==============================================================================
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -19,476 +512,297 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 REGISTRY_ULTIMA_REVISION = "2026-08-20"
 
-# Modelo secundario mínimo aceptable.
-SECONDARY_MODEL_MIN_QUALITY = 0.80
-SECONDARY_MODEL_MIN_SAMPLE = 500
-
-# Freshness del mercado.
-FRESHNESS_EVENT_WINDOW_HOURS = 3
-FRESHNESS_MAX_AGE_MINUTES = 90
-
-# Reglas del pick.
-MIN_EV = 0.05
-MAX_DIVERGENCE = 0.07
-MIN_CONFIDENCE = 8.0
-
 
 # ==============================================================================
-# SYSTEM PROMPT — BLINDADO v4.0
-#
-# Cambio principal respecto a v3.1:
-# La IA YA NO tiene que construir el segundo modelo.
-# El backend se lo entrega verificado.
+# 3. MODEL REGISTRY
 # ==============================================================================
 
-SYSTEM_PROMPT_BLINDADO_V4 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v4.0)
-
-ROL:
-Actúa como Analista Cuantitativo de Deportes y Tipster Profesional.
-
-OBJETIVO:
-Seleccionar UNA sola apuesta —la de mayor confianza estadística— entre TODOS
-los eventos recibidos, únicamente dentro de cuota 1.40-2.00.
-
-Un resultado con 0 picks es válido y preferible a forzar una apuesta.
-
-======================================================================
-1. ANCLA PINNACLE
-======================================================================
-
-OBLIGATORIO:
-
-Usa directamente `_pinnacle_devig`.
-
-NO recalcules el de-vig.
-
-La probabilidad de Pinnacle es la referencia de mercado.
-
-======================================================================
-2. SEGUNDO MODELO
-======================================================================
-
-El backend YA ha ejecutado el Secondary Model Engine.
-
-Cada evento contiene:
-
-`_secondary_model`
-
-Ese objeto es la ÚNICA fuente válida para el segundo modelo.
-
-NO debes construir otro modelo.
-
-NO debes sustituirlo por otro rating.
-
-NO debes utilizar rankings, opiniones, tipsters, intuiciones o estadísticas
-externas para reemplazar `_secondary_model`.
-
-El objeto debe tener:
-
-- status
-- source
-- source_type
-- model_name
-- model_version
-- probability
-- quality_score
-- sample_size
-- validation_status
-- last_update
-
-Solo son válidos:
-
-`status = "verified"`
-
-y
-
-`quality_score >= 0.80`
-
-y
-
-`validation_status = "validated"`
-
-Si `_secondary_model.status` no es "verified":
-DESCARTAR.
-
-Si `quality_score < 0.80`:
-DESCARTAR.
-
-Si `validation_status` no es "validated":
-DESCARTAR.
-
-======================================================================
-3. FRESHNESS GATE
-======================================================================
-
-Comparar `_pinnacle_last_update` contra `inicio_utc`.
-
-Si faltan MENOS de 3 horas para comenzar y `_pinnacle_last_update`
-tiene más de 90 minutos de antigüedad:
-
-DESCARTAR.
-
-Si faltan MÁS de 3 horas:
-
-NO descartar únicamente por antigüedad.
-
-======================================================================
-4. LIQUIDEZ
-======================================================================
-
-Utiliza `_liquidez_backend` tal cual.
-
-No la reinterpretes.
-
-======================================================================
-5. EV
-======================================================================
-
-Para cada lado:
-
-EV = (_secondary_probability * cuota_pinnacle) - 1
-
-EV < 5%:
-DESCARTAR.
-
-======================================================================
-6. DIVERGENCIA
-======================================================================
-
-Divergencia absoluta:
-
-abs(Pinnacle de-vig - Secondary Model probability)
-
-Si > 7 puntos porcentuales:
-
-DESCARTAR.
-
-======================================================================
-7. CONFIANZA
-======================================================================
-
-Calcular 1-10 utilizando:
-
-- ventaja EV
-- calidad del segundo modelo
-- muestra/validación
-- liquidez
-- frescura
-- movimiento Pinnacle cuando exista
-
-Solo un candidato con confianza >= 8/10 puede ser PICK.
-
-======================================================================
-8. ANTI-FABRICACIÓN
-======================================================================
-
-No inventar:
-
-- lesiones
-- alineaciones
-- clima
-- cuotas
-- resultados
-- probabilidades
-- ratings
-- modelos
-- movimientos
-
-El backend ya proporciona los datos cuantitativos.
-
-Si un dato no está disponible:
-NO inventarlo.
-
-======================================================================
-9. RESULTADO
-======================================================================
-
-Seleccionar SOLO UNA apuesta.
-
-Si ninguna cumple todos los gates:
-
-PICK DEL DÍA: NINGUNO
-
-Nunca seleccionar una apuesta para evitar un informe vacío.
-"""
-
-
-# ==============================================================================
-# MODEL REGISTRY
-#
-# El Registry ahora describe:
-#
-# 1. fuente externa
-# 2. modelo interno permitido
-# 3. calidad mínima
-#
-# El modelo interno NO significa "inventar una probabilidad".
-# Es un Elo reproducible calculado a partir de resultados históricos.
-# ==============================================================================
-
-MODEL_REGISTRY = {
-
-    # --------------------------------------------------------------------------
-    # FÚTBOL
-    # --------------------------------------------------------------------------
-
-    "soccer": {
-        "external": [
-            "ClubElo",
-        ],
-        "internal": [
-            "ELO_SOCCER"
-        ],
-        "min_quality": 0.85,
-        "version": "soccer-2.0",
+MODEL_REGISTRY = [
+    {
+        "patron": "americanfootball_nfl_preseason",
+        "fuente_primaria": None,
+        "fuente_secundaria": None,
+        "cobertura": "excluido_estructural",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # TENIS
-    # --------------------------------------------------------------------------
-
-    "tennis": {
-        "external": [
-            "TennisAbstract"
-        ],
-        "internal": [
-            "ELO_TENNIS"
-        ],
-        "min_quality": 0.85,
-        "version": "tennis-2.0",
+    {
+        "patron": "soccer",
+        "fuente_primaria": "ClubElo",
+        "fuente_secundaria": "FiveThirtyEight SPI",
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # MLB
-    # --------------------------------------------------------------------------
-
-    "baseball_mlb": {
-        "external": [
-            "FanGraphs"
-        ],
-        "internal": [
-            "ELO_BASEBALL"
-        ],
-        "min_quality": 0.85,
-        "version": "mlb-2.0",
+    {
+        "patron": "tennis",
+        "fuente_primaria": "TennisAbstract (Elo por superficie)",
+        "fuente_secundaria": "Ranking oficial ATP/WTA",
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # KBO
-    # --------------------------------------------------------------------------
-
-    "baseball_kbo": {
-        "external": [
-            "ESPN KBO"
-        ],
-        "internal": [
-            "ELO_BASEBALL"
-        ],
-        "min_quality": 0.82,
-        "version": "kbo-1.0",
+    {
+        "patron": "baseball_mlb",
+        "fuente_primaria": "FanGraphs",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NPB
-    # --------------------------------------------------------------------------
-
-    "baseball_npb": {
-        "external": [
-            "ESPN NPB"
-        ],
-        "internal": [
-            "ELO_BASEBALL"
-        ],
-        "min_quality": 0.82,
-        "version": "npb-1.0",
+    {
+        "patron": "baseball_kbo",
+        "fuente_primaria": None,
+        "fuente_secundaria": None,
+        "cobertura": "pendiente_desarrollo",
+        "version": "0.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NBA
-    # --------------------------------------------------------------------------
-
-    "basketball_nba": {
-        "external": [
-            "Basketball-Reference"
-        ],
-        "internal": [
-            "ELO_BASKETBALL"
-        ],
-        "min_quality": 0.85,
-        "version": "nba-2.0",
+    {
+        "patron": "baseball_npb",
+        "fuente_primaria": None,
+        "fuente_secundaria": None,
+        "cobertura": "pendiente_desarrollo",
+        "version": "0.0",
     },
-
-    # --------------------------------------------------------------------------
-    # WNBA
-    # --------------------------------------------------------------------------
-
-    "basketball_wnba": {
-        "external": [
-            "Basketball-Reference"
-        ],
-        "internal": [
-            "ELO_BASKETBALL"
-        ],
-        "min_quality": 0.82,
-        "version": "wnba-2.0",
+    {
+        "patron": "basketball_nba",
+        "fuente_primaria": "Basketball-Reference",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NCAAB
-    # --------------------------------------------------------------------------
-
-    "basketball_ncaab": {
-        "external": [
-            "Basketball-Reference"
-        ],
-        "internal": [
-            "ELO_BASKETBALL"
-        ],
-        "min_quality": 0.82,
-        "version": "ncaab-1.0",
+    {
+        "patron": "basketball_wnba",
+        "fuente_primaria": "Basketball-Reference",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NHL
-    # --------------------------------------------------------------------------
-
-    "icehockey_nhl": {
-        "external": [
-            "Hockey-Reference"
-        ],
-        "internal": [
-            "ELO_HOCKEY"
-        ],
-        "min_quality": 0.82,
-        "version": "nhl-2.0",
+    {
+        "patron": "basketball_ncaab",
+        "fuente_primaria": "Basketball-Reference (NCAA)",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # CRICKET
-    # --------------------------------------------------------------------------
-
-    "cricket": {
-        "external": [
-            "ICC",
-            "ESPN Cricinfo"
-        ],
-        "internal": [
-            "ELO_CRICKET"
-        ],
-        "min_quality": 0.80,
-        "version": "cricket-1.0",
+    {
+        "patron": "icehockey_nhl",
+        "fuente_primaria": "Hockey-Reference",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # BOXEO
-    # --------------------------------------------------------------------------
-
-    "boxing": {
-        "external": [
-            "BoxRec"
-        ],
-        "internal": [
-            "ELO_BOXING"
-        ],
-        "min_quality": 0.80,
-        "version": "boxing-1.0",
+    {
+        "patron": "cricket",
+        "fuente_primaria": "ICC Team Ratings",
+        "fuente_secundaria": "ESPN Cricinfo",
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # MMA
-    # --------------------------------------------------------------------------
-
-    "mma": {
-        "external": [
-            "UFC Stats"
-        ],
-        "internal": [
-            "ELO_MMA"
-        ],
-        "min_quality": 0.82,
-        "version": "mma-1.0",
+    {
+        "patron": "boxing",
+        "fuente_primaria": "BoxRec ratings",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NFL
-    # --------------------------------------------------------------------------
-
-    "americanfootball_nfl": {
-        "external": [
-            "ESPN FPI"
-        ],
-        "internal": [
-            "ELO_FOOTBALL"
-        ],
-        "min_quality": 0.85,
-        "version": "nfl-2.0",
+    {
+        "patron": "mma",
+        "fuente_primaria": None,
+        "fuente_secundaria": None,
+        "cobertura": "pendiente_desarrollo",
+        "version": "0.0",
     },
-
-    # --------------------------------------------------------------------------
-    # NFL PRESEASON
-    # --------------------------------------------------------------------------
-
-    "americanfootball_nfl_preseason": {
-        "external": [],
-        "internal": [],
-        "min_quality": 1.0,
-        "version": "excluded",
-        "excluded": True,
+    {
+        "patron": "americanfootball_nfl",
+        "fuente_primaria": "ESPN FPI (Football Power Index)",
+        "fuente_secundaria": None,
+        "cobertura": "externa_directa",
+        "version": "1.0",
     },
+]
+
+DEFAULT_REGISTRY_ENTRY = {
+    "fuente_primaria": None,
+    "fuente_secundaria": None,
+    "cobertura": "pendiente_desarrollo",
+    "version": "0.0",
 }
 
 
+def obtener_entrada_registry(sport_key):
+    if not sport_key:
+        entrada = dict(DEFAULT_REGISTRY_ENTRY)
+    else:
+        sport_key_low = sport_key.lower()
+
+        entrada = next(
+            (
+                e
+                for e in MODEL_REGISTRY
+                if e["patron"].lower() in sport_key_low
+            ),
+            dict(DEFAULT_REGISTRY_ENTRY),
+        )
+
+    entrada = dict(entrada)
+    entrada["ultima_revision"] = REGISTRY_ULTIMA_REVISION
+
+    return entrada
+
+
 # ==============================================================================
-# UTILIDADES
+# 4. UTILIDADES DE FECHA
 # ==============================================================================
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def parse_dt(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+def parsear_fecha_utc(valor):
+    if not valor:
         return None
 
     try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(
+            str(valor).replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
     except Exception:
         return None
 
 
-def normalizar_key(value: Optional[str]) -> str:
-    return (value or "").lower().strip()
+def minutos_hasta_inicio(commence_dt, ahora_utc=None):
+    if commence_dt is None:
+        return None
+
+    if ahora_utc is None:
+        ahora_utc = datetime.now(timezone.utc)
+
+    return round(
+        (commence_dt - ahora_utc).total_seconds() / 60,
+        1,
+    )
 
 
-def obtener_registry(sport_key: str) -> Dict[str, Any]:
+def antiguedad_minutos(timestamp, ahora_utc=None):
+    dt = parsear_fecha_utc(timestamp)
 
-    sport_key = normalizar_key(sport_key)
+    if dt is None:
+        return None
 
-    # Importante:
-    # preseason debe ganar antes que nfl genérico.
-    if "preseason" in sport_key:
-        return MODEL_REGISTRY["americanfootball_nfl_preseason"]
+    if ahora_utc is None:
+        ahora_utc = datetime.now(timezone.utc)
 
-    for key, value in MODEL_REGISTRY.items():
-        if key in sport_key:
-            return value
+    return round(
+        (ahora_utc - dt).total_seconds() / 60,
+        1,
+    )
 
-    return {
-        "external": [],
-        "internal": [],
-        "min_quality": 0.80,
-        "version": "unknown",
+
+# ==============================================================================
+# 5. THE ODDS API
+# ==============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_deportes_activos(api_key):
+    url = f"{ODDS_API_BASE}/sports/"
+
+    params = {
+        "apiKey": api_key,
     }
 
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15,
+        )
+
+        if response.status_code == 401:
+            st.error("❌ API Key de The Odds API inválida o vencida.")
+            return []
+
+        if response.status_code == 429:
+            st.error(
+                "❌ Límite de requests alcanzado en The Odds API (429)."
+            )
+            return []
+
+        response.raise_for_status()
+
+        return [
+            s
+            for s in response.json()
+            if s.get("active")
+            and not s.get("has_outrights")
+        ]
+
+    except Exception as e:
+        st.error(
+            f"Error al obtener deportes desde la API: {e}"
+        )
+        return []
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def obtener_cuotas_api(api_key, sport_key):
+
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
+
+    params = {
+        "apiKey": api_key,
+        "markets": "h2h",
+        "bookmakers": "pinnacle,stake,betonlineag,bet365",
+        "oddsFormat": "decimal",
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15,
+        )
+
+        restantes = response.headers.get(
+            "x-requests-remaining"
+        )
+
+        usados = response.headers.get(
+            "x-requests-used"
+        )
+
+        if restantes is not None:
+            st.session_state["odds_api_uso"] = {
+                "restantes": restantes,
+                "usados": usados,
+            }
+
+        if response.status_code == 401:
+            st.error(
+                f"❌ API Key inválida al consultar {sport_key}."
+            )
+            return []
+
+        if response.status_code == 422:
+            return []
+
+        if response.status_code == 429:
+            st.warning(
+                f"⚠️ Rate limit alcanzado en {sport_key}."
+            )
+            return []
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception:
+        return []
+
 
 # ==============================================================================
-# PINNACLE DEVIG
+# 6. PROBABILIDADES
 # ==============================================================================
 
-def devig_probabilidades(outcomes: List[Dict[str, Any]]) -> Dict[str, float]:
+def devig_probabilidades(outcomes):
 
     if not outcomes:
         return {}
@@ -503,22 +817,26 @@ def devig_probabilidades(outcomes: List[Dict[str, Any]]) -> Dict[str, float]:
         nombre = outcome.get("name")
         precio = outcome.get("price")
 
-        if nombre and precio and precio > 0:
-            implicitas[nombre] = 1.0 / float(precio)
+        if (
+            nombre
+            and isinstance(precio, (int, float))
+            and precio > 1
+        ):
+            implicitas[nombre] = 1.0 / precio
 
-    total = sum(implicitas.values())
+    overround = sum(implicitas.values())
 
-    if total <= 0:
+    if overround <= 0:
         return {}
 
     return {
-        nombre: round(prob / total, 4)
+        nombre: round(prob / overround, 6)
         for nombre, prob in implicitas.items()
     }
 
 
 # ==============================================================================
-# DISPERSIÓN
+# 7. DISPERSIÓN DEL MERCADO
 # ==============================================================================
 
 def calcular_dispersion_mercado(evento):
@@ -526,7 +844,7 @@ def calcular_dispersion_mercado(evento):
     if not isinstance(evento, dict):
         return 0.0
 
-    probs = {}
+    probs_por_resultado = {}
 
     for bookmaker in evento.get("bookmakers", []):
 
@@ -535,9 +853,10 @@ def calcular_dispersion_mercado(evento):
 
         h2h = next(
             (
-                market
-                for market in bookmaker.get("markets", [])
-                if market.get("key") == "h2h"
+                m
+                for m in bookmaker.get("markets", [])
+                if isinstance(m, dict)
+                and m.get("key") == "h2h"
             ),
             None,
         )
@@ -550,635 +869,125 @@ def calcular_dispersion_mercado(evento):
         )
 
         for nombre, prob in devig.items():
-            probs.setdefault(nombre, []).append(prob)
+
+            probs_por_resultado.setdefault(
+                nombre,
+                [],
+            ).append(prob)
 
     dispersiones = [
-        max(values) - min(values)
-        for values in probs.values()
-        if len(values) >= 2
+        max(vals) - min(vals)
+        for vals in probs_por_resultado.values()
+        if len(vals) >= 2
     ]
 
     return max(dispersiones) if dispersiones else 0.0
 
 
 # ==============================================================================
-# ELO ENGINE
-#
-# Este motor NO utiliza cuotas Pinnacle.
-#
-# Solo utiliza resultados históricos.
-#
-# Eso evita contaminar el segundo modelo con el mercado que queremos evaluar.
+# 8. MOVIMIENTO DE PINNACLE
 # ==============================================================================
 
-def elo_expected(elo_a: float, elo_b: float) -> float:
+def registrar_y_calcular_movimientos(
+    eventos_minificados,
+    deporte_key,
+):
 
-    return 1.0 / (
-        1.0 + 10.0 ** ((elo_b - elo_a) / 400.0)
+    if not eventos_minificados:
+        return {}
+
+    state_key = (
+        f"pinnacle_snapshot_{deporte_key}"
     )
 
+    movimientos = {}
+    snapshot_actual = {}
 
-def actualizar_elo(
-    elo_a: float,
-    elo_b: float,
-    resultado_a: float,
-    k: float = 20.0,
-) -> Tuple[float, float]:
+    for ev in eventos_minificados:
 
-    esperado_a = elo_expected(elo_a, elo_b)
-
-    nuevo_a = elo_a + k * (
-        resultado_a - esperado_a
-    )
-
-    nuevo_b = elo_b + k * (
-        (1.0 - resultado_a)
-        - (1.0 - esperado_a)
-    )
-
-    return nuevo_a, nuevo_b
-
-
-def calcular_elo_desde_partidos(
-    partidos: List[Dict[str, Any]],
-    home_team: str,
-    away_team: str,
-    initial_elo: float = 1500.0,
-    k: float = 20.0,
-) -> Optional[Dict[str, Any]]:
-
-    if not partidos:
-        return None
-
-    equipos = {}
-
-    for partido in partidos:
-
-        home = partido.get("home_team")
-        away = partido.get("away_team")
-
-        home_score = partido.get("home_score")
-        away_score = partido.get("away_score")
-
-        if not home or not away:
+        if not isinstance(ev, dict):
             continue
 
-        if home_score is None or away_score is None:
-            continue
+        ev_id = ev.get("id")
+        matchup = ev.get("partido")
+        prices = ev.get("cuotas_pinnacle", {})
 
-        try:
-            home_score = float(home_score)
-            away_score = float(away_score)
-        except Exception:
-            continue
+        if ev_id and prices:
+            snapshot_actual[ev_id] = {
+                "matchup": matchup,
+                "prices": prices,
+            }
 
-        equipos.setdefault(home, initial_elo)
-        equipos.setdefault(away, initial_elo)
-
-        if home_score > away_score:
-            resultado = 1.0
-        elif home_score < away_score:
-            resultado = 0.0
-        else:
-            resultado = 0.5
-
-        equipos[home], equipos[away] = actualizar_elo(
-            equipos[home],
-            equipos[away],
-            resultado,
-            k=k,
-        )
-
-    if home_team not in equipos:
-        return None
-
-    if away_team not in equipos:
-        return None
-
-    elo_home = equipos[home_team]
-    elo_away = equipos[away_team]
-
-    prob_home = elo_expected(
-        elo_home + 50.0,  # ventaja local
-        elo_away,
-    )
-
-    return {
-        "home_elo": round(elo_home, 2),
-        "away_elo": round(elo_away, 2),
-        "probability_home": round(prob_home, 4),
-        "sample_size": len(partidos),
-    }
-
-
-# ==============================================================================
-# MODELO SECUNDARIO
-#
-# Importante:
-#
-# En esta capa NO se usa Pinnacle.
-#
-# El modelo se construye exclusivamente con información independiente.
-# ==============================================================================
-
-def construir_secondary_model_base(
-    evento: Dict[str, Any],
-    probability_home: float,
-    source: str,
-    source_type: str,
-    model_name: str,
-    model_version: str,
-    sample_size: int,
-    quality_score: float,
-    validation_status: str = "validated",
-) -> Dict[str, Any]:
-
-    partido = evento.get("partido", "")
-
-    partes = partido.split(" vs ")
-
-    if len(partes) != 2:
-        return {
-            "status": "unverified",
-            "reason": "No se pudieron separar los equipos.",
-        }
-
-    home = partes[0].strip()
-    away = partes[1].strip()
-
-    probability_home = max(
-        0.001,
-        min(0.999, float(probability_home)),
-    )
-
-    return {
-        "status": "verified",
-        "source": source,
-        "source_type": source_type,
-        "model_name": model_name,
-        "model_version": model_version,
-        "home_team": home,
-        "away_team": away,
-        "probability": {
-            home: round(probability_home, 4),
-            away: round(1.0 - probability_home, 4),
-        },
-        "quality_score": round(quality_score, 3),
-        "sample_size": int(sample_size),
-        "validation_status": validation_status,
-        "last_update": now_utc().isoformat(),
-    }
-
-
-# ==============================================================================
-# VALIDACIÓN DEL SECONDARY MODEL
-# ==============================================================================
-
-def validar_secondary_model(model: Dict[str, Any]) -> Tuple[bool, str]:
-
-    if not model:
-        return False, "secondary_model ausente"
-
-    if model.get("status") != "verified":
-        return False, "status != verified"
-
-    if model.get("validation_status") != "validated":
-        return False, "modelo no validado"
-
-    quality = float(model.get("quality_score", 0))
-
-    if quality < SECONDARY_MODEL_MIN_QUALITY:
-        return False, (
-            f"quality_score {quality:.2f} < "
-            f"{SECONDARY_MODEL_MIN_QUALITY:.2f}"
-        )
-
-    sample = int(model.get("sample_size", 0))
-
-    if sample < SECONDARY_MODEL_MIN_SAMPLE:
-        return False, (
-            f"sample_size {sample} < "
-            f"{SECONDARY_MODEL_MIN_SAMPLE}"
-        )
-
-    probabilities = model.get("probability")
-
-    if not isinstance(probabilities, dict):
-        return False, "probability inválida"
-
-    if not probabilities:
-        return False, "probability vacía"
-
-    total = sum(
-        float(v)
-        for v in probabilities.values()
-        if isinstance(v, (int, float))
-    )
-
-    if not 0.98 <= total <= 1.02:
-        return False, "probabilidades no suman aproximadamente 1"
-
-    return True, "OK"
-
-
-# ==============================================================================
-# FRESHNESS GATE
-# ==============================================================================
-
-def comprobar_frescura(
-    inicio_utc: str,
-    pinnacle_last_update: str,
-) -> Tuple[bool, str]:
-
-    inicio = parse_dt(inicio_utc)
-    update = parse_dt(pinnacle_last_update)
-
-    if not inicio:
-        return False, "inicio_utc inválido"
-
-    if not update:
-        return False, "pinnacle_last_update inválido"
-
-    ahora = now_utc()
-
-    horas_restantes = (
-        inicio - ahora
-    ).total_seconds() / 3600.0
-
-    antiguedad_minutos = (
-        ahora - update
-    ).total_seconds() / 60.0
-
-    # Si el partido ya empezó.
-    if horas_restantes < 0:
-        return False, "evento ya iniciado"
-
-    # Regla Blindado.
     if (
-        horas_restantes < FRESHNESS_EVENT_WINDOW_HOURS
-        and antiguedad_minutos > FRESHNESS_MAX_AGE_MINUTES
+        state_key in st.session_state
+        and isinstance(
+            st.session_state[state_key],
+            dict,
+        )
     ):
-        return False, (
-            f"actualización {antiguedad_minutos:.1f} min antigua "
-            f"con {horas_restantes:.2f} h restantes"
-        )
 
-    return True, (
-        f"{horas_restantes:.2f}h restantes / "
-        f"actualización {antiguedad_minutos:.1f} min"
-    )
+        snapshot_previo = st.session_state[
+            state_key
+        ]
 
+        for ev_id, data_curr in snapshot_actual.items():
 
-# ==============================================================================
-# CALIDAD DEL MODELO
-# ==============================================================================
-
-def calcular_quality_elo(
-    sample_size: int,
-    sport_key: str,
-) -> float:
-
-    # Calidad conservadora.
-    #
-    # No queremos que un modelo con 30 partidos se comporte como uno con
-    # 10.000.
-    #
-    # 500 = mínimo.
-    # 5000 = saturación.
-
-    if sample_size < 500:
-        return 0.0
-
-    ratio = min(
-        sample_size / 5000.0,
-        1.0,
-    )
-
-    base = 0.80 + (
-        0.10 * ratio
-    )
-
-    return round(
-        min(base, 0.90),
-        3,
-    )
-
-
-# ==============================================================================
-# ADAPTADOR PARA HISTÓRICO
-#
-# El backend puede recibir partidos históricos desde una fuente externa.
-#
-# Esta función está separada deliberadamente para que puedas conectar después
-# ESPN/ClubElo/FanGraphs/etc. sin tocar el resto del sistema.
-# ==============================================================================
-
-def obtener_historico_espn(
-    sport_key: str,
-    league: str,
-    limit: int = 1000,
-) -> List[Dict[str, Any]]:
-    """
-    Adaptador genérico.
-
-    Si la fuente no devuelve datos compatibles, devuelve [].
-
-    IMPORTANTE:
-    No inventa datos.
-
-    La URL puede variar por liga/deporte; por eso el adaptador se mantiene
-    aislado y el engine nunca trata un [] como modelo válido.
-    """
-
-    # Mapeo de ligas conocidas.
-    endpoints = {
-
-        "baseball_mlb": (
-            "https://site.api.espn.com/apis/site/v2/sports/"
-            "baseball/mlb/scoreboard"
-        ),
-
-        "basketball_nba": (
-            "https://site.api.espn.com/apis/site/v2/sports/"
-            "basketball/nba/scoreboard"
-        ),
-
-        "basketball_wnba": (
-            "https://site.api.espn.com/apis/site/v2/sports/"
-            "basketball/wnba/scoreboard"
-        ),
-
-        "icehockey_nhl": (
-            "https://site.api.espn.com/apis/site/v2/sports/"
-            "hockey/nhl/scoreboard"
-        ),
-
-        "americanfootball_nfl": (
-            "https://site.api.espn.com/apis/site/v2/sports/"
-            "football/nfl/scoreboard"
-        ),
-    }
-
-    url = endpoints.get(sport_key)
-
-    if not url:
-        return []
-
-    try:
-        r = requests.get(
-            url,
-            timeout=15,
-        )
-
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-
-    except Exception:
-        return []
-
-    partidos = []
-
-    for event in data.get("events", []):
-
-        try:
-            competitions = event.get(
-                "competitions",
-                [],
-            )
-
-            if not competitions:
+            if ev_id not in snapshot_previo:
                 continue
 
-            competition = competitions[0]
+            data_prev = snapshot_previo[ev_id]
 
-            competitors = competition.get(
-                "competitors",
-                [],
-            )
+            for team, price_curr in data_curr.get(
+                "prices",
+                {},
+            ).items():
 
-            if len(competitors) < 2:
-                continue
+                price_prev = data_prev.get(
+                    "prices",
+                    {},
+                ).get(team)
 
-            home = None
-            away = None
+                if (
+                    price_prev
+                    and price_curr
+                    and price_prev != price_curr
+                ):
 
-            for c in competitors:
+                    pct_change = round(
+                        (
+                            (
+                                price_curr
+                                - price_prev
+                            )
+                            / price_prev
+                        )
+                        * 100,
+                        2,
+                    )
 
-                team = c.get("team", {}).get("displayName")
+                    direccion = (
+                        "subió"
+                        if pct_change > 0
+                        else "bajó"
+                    )
 
-                score = c.get("score")
+                    movimientos[
+                        f"{data_curr['matchup']} ({team})"
+                    ] = (
+                        f"Cuota cambió de "
+                        f"{price_prev} a "
+                        f"{price_curr} "
+                        f"({direccion} "
+                        f"{abs(pct_change)}%)"
+                    )
 
-                if c.get("homeAway") == "home":
-                    home = {
-                        "name": team,
-                        "score": score,
-                    }
+    st.session_state[state_key] = snapshot_actual
 
-                elif c.get("homeAway") == "away":
-                    away = {
-                        "name": team,
-                        "score": score,
-                    }
-
-            if not home or not away:
-                continue
-
-            if home["score"] is None or away["score"] is None:
-                continue
-
-            partidos.append(
-                {
-                    "home_team": home["name"],
-                    "away_team": away["name"],
-                    "home_score": float(home["score"]),
-                    "away_score": float(away["score"]),
-                }
-            )
-
-        except Exception:
-            continue
-
-    return partidos[-limit:]
-
-
-# ==============================================================================
-# FALLBACK CONTROLADO
-#
-# SOLO se permite si el histórico supera los requisitos.
-# ==============================================================================
-
-def construir_modelo_elo_para_evento(
-    evento: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    sport_key = evento.get("sport_key", "")
-
-    registry = obtener_registry(
-        sport_key
-    )
-
-    if "ELO_" not in " ".join(
-        registry.get("internal", [])
-    ):
-        return {
-            "status": "unverified",
-            "reason": "No existe modelo interno autorizado",
-        }
-
-    partido = evento.get("partido", "")
-
-    partes = partido.split(" vs ")
-
-    if len(partes) != 2:
-        return {
-            "status": "unverified",
-            "reason": "partido inválido",
-        }
-
-    home_team = partes[0].strip()
-    away_team = partes[1].strip()
-
-    historico = obtener_historico_espn(
-        sport_key=sport_key,
-        league=sport_key,
-    )
-
-    if len(historico) < SECONDARY_MODEL_MIN_SAMPLE:
-        return {
-            "status": "unverified",
-            "reason": (
-                f"histórico insuficiente: "
-                f"{len(historico)} < "
-                f"{SECONDARY_MODEL_MIN_SAMPLE}"
-            ),
-        }
-
-    resultado = calcular_elo_desde_partidos(
-        partidos=historico,
-        home_team=home_team,
-        away_team=away_team,
-    )
-
-    if not resultado:
-        return {
-            "status": "unverified",
-            "reason": "equipos no encontrados en histórico",
-        }
-
-    quality = calcular_quality_elo(
-        len(historico),
-        sport_key,
-    )
-
-    if quality < SECONDARY_MODEL_MIN_QUALITY:
-        return {
-            "status": "unverified",
-            "reason": f"quality_score={quality}",
-        }
-
-    return construir_secondary_model_base(
-        evento=evento,
-        probability_home=resultado["probability_home"],
-        source="ESPN historical results",
-        source_type="validated_internal_model",
-        model_name=f"{sport_key} Elo",
-        model_version=registry.get(
-            "version",
-            "unknown",
-        ),
-        sample_size=len(historico),
-        quality_score=quality,
-    )
+    return movimientos
 
 
 # ==============================================================================
-# SECONDARY MODEL ENGINE
-# ==============================================================================
-
-@st.cache_data(
-    ttl=900,
-    show_spinner=False,
-)
-def ejecutar_secondary_model_engine(
-    eventos: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-
-    resultados = []
-
-    stats = {
-        "eventos": 0,
-        "verified": 0,
-        "unverified": 0,
-        "preseason": 0,
-        "historico_insuficiente": 0,
-    }
-
-    for evento in eventos:
-
-        stats["eventos"] += 1
-
-        registry = obtener_registry(
-            evento.get("sport_key", "")
-        )
-
-        if registry.get("excluded"):
-            stats["preseason"] += 1
-            continue
-
-        # ----------------------------------------------------------------------
-        # Intento modelo interno reproducible.
-        #
-        # Para las fuentes externas directas, el JSON informa al modelo IA
-        # cuál debe verificarse.
-        #
-        # No inventamos una probabilidad externa.
-        # ----------------------------------------------------------------------
-
-        secondary_model = construir_modelo_elo_para_evento(
-            evento
-        )
-
-        if secondary_model.get("status") != "verified":
-
-            stats["unverified"] += 1
-
-            if "histórico insuficiente" in secondary_model.get(
-                "reason",
-                "",
-            ):
-                stats["historico_insuficiente"] += 1
-
-            # No enviar eventos sin segundo modelo.
-            continue
-
-        valid, reason = validar_secondary_model(
-            secondary_model
-        )
-
-        if not valid:
-
-            stats["unverified"] += 1
-            continue
-
-        evento_nuevo = dict(evento)
-
-        evento_nuevo[
-            "_secondary_model"
-        ] = secondary_model
-
-        resultados.append(
-            evento_nuevo
-        )
-
-        stats["verified"] += 1
-
-    return resultados, stats
-
-
-# ==============================================================================
-# PRE-FILTRO PRINCIPAL
+# 9. PRE-FILTRO + ENRIQUECIMIENTO
 # ==============================================================================
 
 def filtrar_y_enriquecer(
@@ -1186,21 +995,37 @@ def filtrar_y_enriquecer(
     horas_ventana=24,
 ):
 
-    if not datos_crudos or not isinstance(
-        datos_crudos,
-        list,
+    if (
+        not datos_crudos
+        or not isinstance(datos_crudos, list)
     ):
-        return [], "Backend pre-filtró 0 eventos."
+        return [], {
+            "total": 0,
+            "candidatos": 0,
+            "fecha": 0,
+            "sin_fecha": 0,
+            "sin_pinnacle": 0,
+            "fuera_cuota": 0,
+            "estructural": 0,
+            "pendiente": 0,
+            "frescura": 0,
+        }
 
     eventos_validos = []
 
-    descartados_fecha = 0
-    descartados_sin_fecha = 0
-    descartados_sin_pinnacle = 0
-    descartados_fuera_rango = 0
-    descartados_preseason = 0
+    contador = {
+        "total": len(datos_crudos),
+        "candidatos": 0,
+        "fecha": 0,
+        "sin_fecha": 0,
+        "sin_pinnacle": 0,
+        "fuera_cuota": 0,
+        "estructural": 0,
+        "pendiente": 0,
+        "frescura": 0,
+    }
 
-    ahora_utc = now_utc()
+    ahora_utc = datetime.now(timezone.utc)
 
     limite_utc = (
         ahora_utc
@@ -1212,33 +1037,37 @@ def filtrar_y_enriquecer(
         if not isinstance(evento, dict):
             continue
 
-        sport_key = evento.get(
-            "sport_key",
-            "",
-        )
+        sport_key = evento.get("sport_key")
 
-        registry = obtener_registry(
+        registry_entry = obtener_entrada_registry(
             sport_key
         )
 
-        if registry.get("excluded"):
-            descartados_preseason += 1
+        # ----------------------------------------------------------
+        # EXCLUSIÓN ESTRUCTURAL
+        # ----------------------------------------------------------
+
+        if (
+            registry_entry["cobertura"]
+            == "excluido_estructural"
+        ):
+            contador["estructural"] += 1
             continue
+
+        # ----------------------------------------------------------
+        # FECHA
+        # ----------------------------------------------------------
 
         commence_str = evento.get(
             "commence_time"
         )
 
-        if not commence_str:
-            descartados_sin_fecha += 1
-            continue
-
-        commence_dt = parse_dt(
+        commence_dt = parsear_fecha_utc(
             commence_str
         )
 
-        if not commence_dt:
-            descartados_sin_fecha += 1
+        if commence_dt is None:
+            contador["sin_fecha"] += 1
             continue
 
         if not (
@@ -1246,8 +1075,12 @@ def filtrar_y_enriquecer(
             <= commence_dt
             <= limite_utc
         ):
-            descartados_fecha += 1
+            contador["fecha"] += 1
             continue
+
+        # ----------------------------------------------------------
+        # PINNACLE
+        # ----------------------------------------------------------
 
         pinnacle = next(
             (
@@ -1256,13 +1089,14 @@ def filtrar_y_enriquecer(
                     "bookmakers",
                     [],
                 )
-                if b.get("key") == "pinnacle"
+                if isinstance(b, dict)
+                and b.get("key") == "pinnacle"
             ),
             None,
         )
 
         if not pinnacle:
-            descartados_sin_pinnacle += 1
+            contador["sin_pinnacle"] += 1
             continue
 
         h2h = next(
@@ -1272,13 +1106,14 @@ def filtrar_y_enriquecer(
                     "markets",
                     [],
                 )
-                if m.get("key") == "h2h"
+                if isinstance(m, dict)
+                and m.get("key") == "h2h"
             ),
             None,
         )
 
         if not h2h:
-            descartados_sin_pinnacle += 1
+            contador["sin_pinnacle"] += 1
             continue
 
         outcomes = h2h.get(
@@ -1286,25 +1121,85 @@ def filtrar_y_enriquecer(
             [],
         )
 
-        if not any(
-            1.40
-            <= o.get("price", 0)
+        # ----------------------------------------------------------
+        # CUOTA
+        # ----------------------------------------------------------
+
+        en_rango = any(
+            isinstance(o, dict)
+            and isinstance(
+                o.get("price"),
+                (int, float),
+            )
+            and 1.40
+            <= o.get("price")
             <= 2.00
             for o in outcomes
-            if isinstance(o, dict)
-        ):
-            descartados_fuera_rango += 1
+        )
+
+        if not en_rango:
+            contador["fuera_cuota"] += 1
             continue
+
+        # ----------------------------------------------------------
+        # PINNACLE DEVIG
+        # ----------------------------------------------------------
 
         pinnacle_devig = devig_probabilidades(
             outcomes
         )
 
-        cuotas_pinnacle = {
-            o.get("name"): o.get("price")
-            for o in outcomes
-            if isinstance(o, dict)
-        }
+        # ----------------------------------------------------------
+        # FRESCURA
+        # ----------------------------------------------------------
+
+        last_update = pinnacle.get(
+            "last_update"
+        )
+
+        minutos_inicio = minutos_hasta_inicio(
+            commence_dt,
+            ahora_utc,
+        )
+
+        minutos_antiguedad = antiguedad_minutos(
+            last_update,
+            ahora_utc,
+        )
+
+        freshness_status = (
+            "NO_VERIFICABLE"
+        )
+
+        if minutos_antiguedad is not None:
+
+            if minutos_inicio < 180:
+
+                if minutos_antiguedad > 90:
+                    freshness_status = (
+                        "DESCARTAR_FRESCURA"
+                    )
+                    contador["frescura"] += 1
+                    continue
+
+                freshness_status = (
+                    "FRESCO_CERCA_EVENTO"
+                )
+
+            else:
+
+                if minutos_antiguedad <= 90:
+                    freshness_status = (
+                        "FRESCO"
+                    )
+                else:
+                    freshness_status = (
+                        "ANTIGUO_PERO_NO_DESCARTABLE"
+                    )
+
+        # ----------------------------------------------------------
+        # LIQUIDEZ
+        # ----------------------------------------------------------
 
         n_bookmakers = len(
             evento.get(
@@ -1328,12 +1223,39 @@ def filtrar_y_enriquecer(
 
         else:
             liquidez = (
-                "Media/Baja — evaluar "
-                "según categoría de liga"
+                "Media/Baja — evaluar según "
+                "categoría de liga"
             )
 
-        evento_minificado = {
+        # ----------------------------------------------------------
+        # CUOTAS PINNACLE
+        # ----------------------------------------------------------
 
+        cuotas_pinnacle = {
+            o.get("name"): o.get("price")
+            for o in outcomes
+            if (
+                isinstance(o, dict)
+                and o.get("name")
+                and o.get("price")
+            )
+        }
+
+        # ----------------------------------------------------------
+        # PENDIENTE DE DESARROLLO
+        # ----------------------------------------------------------
+
+        if (
+            registry_entry["cobertura"]
+            == "pendiente_desarrollo"
+        ):
+            contador["pendiente"] += 1
+
+        # ----------------------------------------------------------
+        # EVENTO MINIFICADO
+        # ----------------------------------------------------------
+
+        evento_minificado = {
             "id": evento.get("id"),
 
             "deporte": (
@@ -1344,19 +1266,34 @@ def filtrar_y_enriquecer(
             "sport_key": sport_key,
 
             "partido": (
-                f"{evento.get('home_team')} "
-                f"vs "
+                f"{evento.get('home_team')}"
+                f" vs "
                 f"{evento.get('away_team')}"
+            ),
+
+            "home_team": evento.get(
+                "home_team"
+            ),
+
+            "away_team": evento.get(
+                "away_team"
             ),
 
             "inicio_utc": commence_str,
 
-            "cuotas_pinnacle": cuotas_pinnacle,
+            "_minutos_hasta_inicio": minutos_inicio,
 
             "_pinnacle_devig": pinnacle_devig,
 
-            "_pinnacle_last_update":
-                pinnacle.get("last_update"),
+            "cuotas_pinnacle": cuotas_pinnacle,
+
+            "_pinnacle_last_update": last_update,
+
+            "_pinnacle_antiguedad_minutos":
+                minutos_antiguedad,
+
+            "_freshness_status":
+                freshness_status,
 
             "_liquidez_backend": liquidez,
 
@@ -1370,247 +1307,64 @@ def filtrar_y_enriquecer(
                 n_bookmakers,
 
             "_registry_modelo_secundario":
-                registry,
+                registry_entry,
         }
 
         eventos_validos.append(
             evento_minificado
         )
 
-    resumen = (
-        f"Backend pre-filtró {len(datos_crudos)} eventos: "
-        f"{len(eventos_validos)} candidatos iniciales. "
-        f"{descartados_fecha} fuera de ventana, "
-        f"{descartados_sin_fecha} sin fecha válida, "
-        f"{descartados_sin_pinnacle} sin Pinnacle, "
-        f"{descartados_fuera_rango} fuera de cuota 1.40-2.00, "
-        f"{descartados_preseason} excluidos estructuralmente."
+    contador["candidatos"] = len(
+        eventos_validos
     )
 
-    return eventos_validos, resumen
+    return eventos_validos, contador
 
 
 # ==============================================================================
-# MOVIMIENTOS PINNACLE
+# 10. RESUMEN DEL FILTRO
 # ==============================================================================
 
-def registrar_y_calcular_movimientos(
-    eventos_minificados,
-    deporte_key,
+def construir_resumen_filtro(
+    contador,
+    horas_ventana,
 ):
 
-    if not eventos_minificados:
-        return {}
+    return (
+        f"Backend recibió "
+        f"{contador['total']} eventos.\n\n"
 
-    state_key = (
-        f"pinnacle_snapshot_{deporte_key}"
+        f"Candidatos enviados a IA: "
+        f"{contador['candidatos']}\n"
+
+        f"Ventana: próximas "
+        f"{horas_ventana} horas.\n\n"
+
+        f"DESCARTES BACKEND:\n"
+        f"- Fuera de ventana temporal: "
+        f"{contador['fecha']}\n"
+        f"- Fecha faltante/ilegible: "
+        f"{contador['sin_fecha']}\n"
+        f"- Sin Pinnacle/h2h: "
+        f"{contador['sin_pinnacle']}\n"
+        f"- Sin cuota 1.40-2.00: "
+        f"{contador['fuera_cuota']}\n"
+        f"- Exclusión estructural: "
+        f"{contador['estructural']}\n"
+        f"- Gate de frescura: "
+        f"{contador['frescura']}\n"
+        f"- Sin segundo modelo autorizado: "
+        f"{contador['pendiente']}\n\n"
+
+        f"IMPORTANTE:\n"
+        f"Los eventos enviados a la IA todavía deben pasar "
+        f"la validación del segundo modelo, EV >=5%, "
+        f"divergencia <=7% y confianza >=8/10."
     )
-
-    movimientos = {}
-
-    snapshot_actual = {}
-
-    for ev in eventos_minificados:
-
-        ev_id = ev.get("id")
-
-        prices = ev.get(
-            "cuotas_pinnacle",
-            {},
-        )
-
-        if ev_id and prices:
-
-            snapshot_actual[ev_id] = {
-                "matchup":
-                    ev.get("partido"),
-                "prices":
-                    prices,
-            }
-
-    if state_key in st.session_state:
-
-        snapshot_previo = (
-            st.session_state[state_key]
-        )
-
-        for ev_id, actual in snapshot_actual.items():
-
-            if ev_id not in snapshot_previo:
-                continue
-
-            previo = snapshot_previo[
-                ev_id
-            ]
-
-            for team, price_actual in actual[
-                "prices"
-            ].items():
-
-                price_prev = previo[
-                    "prices"
-                ].get(team)
-
-                if (
-                    price_prev
-                    and price_prev != price_actual
-                ):
-
-                    cambio = (
-                        (
-                            price_actual
-                            - price_prev
-                        )
-                        / price_prev
-                    ) * 100
-
-                    direccion = (
-                        "subió"
-                        if cambio > 0
-                        else "bajó"
-                    )
-
-                    movimientos[
-                        f"{actual['matchup']} ({team})"
-                    ] = (
-                        f"Cuota cambió de "
-                        f"{price_prev} a "
-                        f"{price_actual} "
-                        f"({direccion} "
-                        f"{abs(cambio):.2f}%)"
-                    )
-
-    st.session_state[
-        state_key
-    ] = snapshot_actual
-
-    return movimientos
 
 
 # ==============================================================================
-# THE ODDS API
-# ==============================================================================
-
-@st.cache_data(
-    ttl=3600,
-    show_spinner=False,
-)
-def obtener_deportes_activos(api_key):
-
-    url = (
-        f"{ODDS_API_BASE}/sports/"
-        f"?apiKey={api_key}"
-    )
-
-    try:
-
-        response = requests.get(
-            url,
-            timeout=10,
-        )
-
-        if response.status_code == 401:
-
-            st.error(
-                "❌ API Key inválida."
-            )
-
-            return []
-
-        if response.status_code == 429:
-
-            st.error(
-                "❌ Rate limit."
-            )
-
-            return []
-
-        response.raise_for_status()
-
-        return [
-            sport
-            for sport in response.json()
-            if sport.get("active")
-            and not sport.get("has_outrights")
-        ]
-
-    except Exception as e:
-
-        st.error(
-            f"Error The Odds API: {e}"
-        )
-
-        return []
-
-
-@st.cache_data(
-    ttl=90,
-    show_spinner=False,
-)
-def obtener_cuotas_api(
-    api_key,
-    sport_key,
-):
-
-    url = (
-        f"{ODDS_API_BASE}/sports/"
-        f"{sport_key}/odds/"
-    )
-
-    params = {
-
-        "apiKey": api_key,
-
-        "markets": "h2h",
-
-        "bookmakers":
-            "pinnacle,stake,betonlineag,bet365",
-    }
-
-    try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=10,
-        )
-
-        restantes = response.headers.get(
-            "x-requests-remaining"
-        )
-
-        usados = response.headers.get(
-            "x-requests-used"
-        )
-
-        if restantes is not None:
-
-            st.session_state[
-                "odds_api_uso"
-            ] = {
-                "restantes": restantes,
-                "usados": usados,
-            }
-
-        if response.status_code == 401:
-            return []
-
-        if response.status_code == 422:
-            return []
-
-        if response.status_code == 429:
-            return []
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception:
-        return []
-
-
-# ==============================================================================
-# GEMINI
+# 11. GEMINI — LISTADO DINÁMICO
 # ==============================================================================
 
 @st.cache_data(
@@ -1628,31 +1382,31 @@ def listar_modelos_gemini(
 
     try:
 
-        r = requests.get(
+        response = requests.get(
             url,
-            timeout=10,
+            timeout=15,
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        modelos = r.json().get(
+        modelos = response.json().get(
             "models",
             [],
         )
 
         utilizables = []
 
-        for model in modelos:
+        for modelo in modelos:
 
-            nombre = model.get(
-                "name",
-                "",
-            ).replace(
-                "models/",
-                "",
+            nombre = (
+                modelo.get("name", "")
+                .replace(
+                    "models/",
+                    "",
+                )
             )
 
-            metodos = model.get(
+            metodos = modelo.get(
                 "supportedGenerationMethods",
                 [],
             )
@@ -1660,36 +1414,42 @@ def listar_modelos_gemini(
             if (
                 "generateContent"
                 in metodos
-                and not any(
-                    x in nombre
+                and nombre
+            ):
+
+                if not any(
+                    x in nombre.lower()
                     for x in [
+                        "embedding",
                         "image",
                         "audio",
                         "tts",
-                        "embedding",
                         "live",
-                        "vision",
                     ]
-                )
-            ):
+                ):
 
-                utilizables.append(
-                    nombre
-                )
+                    utilizables.append(
+                        nombre
+                    )
 
         return sorted(
-            utilizables,
+            list(set(utilizables)),
             reverse=True,
         )
 
     except Exception as e:
 
         st.error(
-            f"Error Gemini: {e}"
+            "No se pudo obtener la lista "
+            f"de modelos Gemini: {e}"
         )
 
         return []
 
+
+# ==============================================================================
+# 12. GEMINI REST + GOOGLE SEARCH GROUNDING
+# ==============================================================================
 
 def llamar_gemini_rest(
     gemini_api_key,
@@ -1705,6 +1465,7 @@ def llamar_gemini_rest(
     headers = {
         "x-goog-api-key":
             gemini_api_key,
+
         "Content-Type":
             "application/json",
     }
@@ -1712,52 +1473,85 @@ def llamar_gemini_rest(
     body = {
         "contents": [
             {
+                "role": "user",
                 "parts": [
                     {
                         "text":
                             prompt_texto
                     }
-                ]
+                ],
             }
-        ]
+        ],
+
+        # --------------------------------------------------------------
+        # NUEVO:
+        # Gemini API recibe herramienta de búsqueda.
+        # Esto permite que el análisis directo en la aplicación pueda
+        # investigar las fuentes externas autorizadas.
+        # --------------------------------------------------------------
+        "tools": [
+            {
+                "google_search": {}
+            }
+        ],
+
+        "generationConfig": {
+            "temperature": 0.1,
+        },
     }
 
-    r = requests.post(
+    response = requests.post(
         url,
         headers=headers,
         json=body,
-        timeout=90,
+        timeout=180,
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-    data = r.json()
+    data = response.json()
 
-    partes = (
-        data[
-            "candidates"
-        ][0][
-            "content"
-        ][
-            "parts"
-        ]
+    texto = ""
+
+    candidates = data.get(
+        "candidates",
+        [],
     )
 
-    texto = "".join(
-        p.get("text", "")
-        for p in partes
+    if candidates:
+
+        content = candidates[0].get(
+            "content",
+            {},
+        )
+
+        for part in content.get(
+            "parts",
+            [],
+        ):
+
+            if part.get("text"):
+                texto += part["text"]
+
+    grounding = (
+        candidates[0]
+        .get("groundingMetadata", {})
+        if candidates
+        else {}
     )
 
-    uso = data.get(
-        "usageMetadata",
-        {},
+    return (
+        texto,
+        data.get(
+            "usageMetadata",
+            {},
+        ),
+        grounding,
     )
-
-    return texto, uso
 
 
 # ==============================================================================
-# CLAUDE
+# 13. CLAUDE — LISTADO DINÁMICO
 # ==============================================================================
 
 @st.cache_data(
@@ -1773,7 +1567,6 @@ def listar_modelos_claude(
     )
 
     headers = {
-
         "x-api-key":
             anthropic_api_key,
 
@@ -1783,15 +1576,15 @@ def listar_modelos_claude(
 
     try:
 
-        r = requests.get(
+        response = requests.get(
             url,
             headers=headers,
-            timeout=10,
+            timeout=15,
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        modelos = r.json().get(
+        modelos = response.json().get(
             "data",
             [],
         )
@@ -1805,11 +1598,16 @@ def listar_modelos_claude(
     except Exception as e:
 
         st.error(
-            f"Error Claude: {e}"
+            "No se pudo obtener la lista "
+            f"de modelos Claude: {e}"
         )
 
         return []
 
+
+# ==============================================================================
+# 14. CLAUDE — WEB SEARCH + PAUSE TURN
+# ==============================================================================
 
 def llamar_claude_rest(
     anthropic_api_key,
@@ -1823,7 +1621,6 @@ def llamar_claude_rest(
     )
 
     headers = {
-
         "x-api-key":
             anthropic_api_key,
 
@@ -1834,76 +1631,260 @@ def llamar_claude_rest(
             "application/json",
     }
 
-    body = {
+    tools = [
+        {
+            "type":
+                "web_search_20250305",
 
-        "model":
-            modelo,
+            "name":
+                "web_search",
 
-        "max_tokens":
-            max_tokens,
+            "max_uses":
+                20,
+        }
+    ]
 
-        "messages": [
-            {
-                "role": "user",
-                "content":
-                    prompt_texto,
-            }
-        ],
+    messages = [
+        {
+            "role":
+                "user",
 
-        "tools": [
-            {
-                "type":
-                    "web_search_20250305",
+            "content":
+                prompt_texto,
+        }
+    ]
 
-                "name":
-                    "web_search",
-            }
-        ],
-    }
+    todas_las_queries = []
 
-    r = requests.post(
-        url,
-        headers=headers,
-        json=body,
-        timeout=120,
-    )
+    max_turnos_web = 5
 
-    r.raise_for_status()
+    for _ in range(
+        max_turnos_web
+    ):
 
-    data = r.json()
+        body = {
+            "model":
+                modelo,
 
-    partes_texto = [
-        block.get("text", "")
+            "max_tokens":
+                max_tokens,
+
+            "messages":
+                messages,
+
+            "tools":
+                tools,
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=180,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        # ----------------------------------------------------------
+        # Registrar búsquedas realizadas
+        # ----------------------------------------------------------
+
         for block in data.get(
             "content",
             [],
-        )
-        if block.get("type") == "text"
-    ]
+        ):
 
-    return "\n\n".join(
-        partes_texto
+            if (
+                block.get("type")
+                == "server_tool_use"
+                and block.get("name")
+                == "web_search"
+            ):
+
+                query = (
+                    block.get(
+                        "input",
+                        {},
+                    )
+                    .get(
+                        "query"
+                    )
+                )
+
+                if query:
+                    todas_las_queries.append(
+                        query
+                    )
+
+        stop_reason = data.get(
+            "stop_reason"
+        )
+
+        # ----------------------------------------------------------
+        # Respuesta completa
+        # ----------------------------------------------------------
+
+        if stop_reason != "pause_turn":
+
+            textos = [
+                block.get(
+                    "text",
+                    "",
+                )
+                for block in data.get(
+                    "content",
+                    [],
+                )
+                if block.get(
+                    "type"
+                ) == "text"
+            ]
+
+            return (
+                "\n\n".join(textos),
+                todas_las_queries,
+                data.get(
+                    "usage",
+                    {},
+                ),
+            )
+
+        # ----------------------------------------------------------
+        # PAUSE TURN:
+        # conservar exactamente la respuesta del assistant
+        # y continuar.
+        # ----------------------------------------------------------
+
+        messages.append(
+            {
+                "role":
+                    "assistant",
+
+                "content":
+                    data.get(
+                        "content",
+                        [],
+                    ),
+            }
+        )
+
+        messages.append(
+            {
+                "role":
+                    "user",
+
+                "content":
+                    (
+                        "Continúa la investigación web "
+                        "y completa el análisis siguiendo "
+                        "estrictamente todas las reglas "
+                        "del prompt original. No inventes "
+                        "ningún dato."
+                    ),
+            }
+        )
+
+    raise RuntimeError(
+        "Claude superó el máximo de turnos "
+        "permitidos para la búsqueda web."
     )
 
 
 # ==============================================================================
-# STREAMLIT UI
+# 15. CONSTRUIR PROMPT FINAL
+# ==============================================================================
+
+def construir_prompt_final(
+    seleccion,
+    hora_rd,
+    ahora_utc,
+    resumen_filtro,
+    seccion_movimiento,
+    eventos_filtrados,
+):
+
+    return (
+        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+
+        f"==================================================\n"
+        f"CONTEXTO DE EJECUCIÓN DEL BACKEND\n"
+        f"==================================================\n\n"
+
+        f"ÁMBITO:\n"
+        f"{seleccion}\n\n"
+
+        f"HORA CONSULTA RD:\n"
+        f"{hora_rd}\n\n"
+
+        f"HORA CONSULTA UTC:\n"
+        f"{ahora_utc.isoformat()}\n\n"
+
+        f"RESUMEN DE PRE-FILTRADO:\n"
+        f"{resumen_filtro}\n\n"
+
+        f"{seccion_movimiento}\n\n"
+
+        f"==================================================\n"
+        f"REGLA DE INTEGRIDAD DEL JSON\n"
+        f"==================================================\n\n"
+
+        f"Los siguientes campos son calculados por el backend "
+        f"y son de SOLO LECTURA:\n\n"
+
+        f"`_pinnacle_devig`\n"
+        f"`_pinnacle_last_update`\n"
+        f"`_pinnacle_antiguedad_minutos`\n"
+        f"`_minutos_hasta_inicio`\n"
+        f"`_freshness_status`\n"
+        f"`_liquidez_backend`\n"
+        f"`_dispersion_max_entre_casas`\n"
+        f"`_n_casas_reportando`\n"
+        f"`_registry_modelo_secundario`\n\n"
+
+        f"NO los recalcules.\n"
+        f"NO los modifiques.\n"
+        f"NO los sustituyas.\n\n"
+
+        f"El segundo modelo DEBE obtenerse mediante búsqueda web "
+        f"real y exclusivamente desde la fuente autorizada "
+        f"en `_registry_modelo_secundario`.\n\n"
+
+        f"==================================================\n"
+        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS\n"
+        f"==================================================\n\n"
+
+        f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
+    )
+
+
+# ==============================================================================
+# 16. INTERFAZ STREAMLIT
 # ==============================================================================
 
 st.set_page_config(
     page_title=
-        "Analista Cuantitativo",
-    layout="wide",
+        "Analista Cuantitativo de Apuestas",
+
+    layout=
+        "wide",
 )
 
 st.title(
-    "📊 Analista de Apuesta Única v4.0"
+    "📊 Analista de Apuesta Única "
+    "v3.2 — Multi-IA & Multi-Deporte"
 )
+
+
+# ==============================================================================
+# SIDEBAR
+# ==============================================================================
 
 with st.sidebar:
 
     st.header(
-        "🔑 Configuración APIs"
+        "🔑 Configuración de APIs"
     )
 
     api_key = st.secrets.get(
@@ -1926,7 +1907,7 @@ with st.sidebar:
     if not gemini_api_key:
 
         gemini_api_key = st.text_input(
-            "Gemini API Key:",
+            "Gemini API Key (Opcional):",
             type="password",
         )
 
@@ -1938,7 +1919,7 @@ with st.sidebar:
     if not anthropic_api_key:
 
         anthropic_api_key = st.text_input(
-            "Anthropic API Key:",
+            "Anthropic / Claude API Key (Opcional):",
             type="password",
         )
 
@@ -1949,23 +1930,27 @@ with st.sidebar:
         f"{REGISTRY_ULTIMA_REVISION}"
     )
 
-    st.caption(
-        f"Minimum model quality: "
-        f"{SECONDARY_MODEL_MIN_QUALITY}"
-    )
+    if "odds_api_uso" in st.session_state:
 
-    st.caption(
-        f"Minimum sample: "
-        f"{SECONDARY_MODEL_MIN_SAMPLE}"
-    )
+        uso = st.session_state[
+            "odds_api_uso"
+        ]
 
+        st.caption(
+            "📉 Odds API — "
+            f"usados: {uso['usados']} · "
+            f"restantes: {uso['restantes']}"
+        )
+
+
+# ==============================================================================
+# PROCESAMIENTO PRINCIPAL
+# ==============================================================================
 
 if api_key:
 
-    deportes_lista = (
-        obtener_deportes_activos(
-            api_key
-        )
+    deportes_lista = obtener_deportes_activos(
+        api_key
     )
 
     if deportes_lista:
@@ -1977,13 +1962,17 @@ if api_key:
 
         for dep in deportes_lista:
 
-            opciones_deporte[
+            label = (
                 f"{dep.get('group')} - "
                 f"{dep.get('title')}"
+            )
+
+            opciones_deporte[
+                label
             ] = dep.get("key")
 
         seleccion = st.selectbox(
-            "Selecciona ámbito:",
+            "Selecciona el deporte o ámbito a analizar:",
             list(
                 opciones_deporte.keys()
             ),
@@ -1995,27 +1984,56 @@ if api_key:
             ]
         )
 
+        st.divider()
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+
+            horas_ventana = st.number_input(
+                "Ventana de eventos futuros (horas):",
+                min_value=1,
+                max_value=72,
+                value=24,
+                step=1,
+            )
+
+        with col_b:
+
+            st.info(
+                "🎯 Filtros principales: "
+                "cuota 1.40–2.00 · EV mínimo 5% · "
+                "divergencia máxima 7% · "
+                "confianza mínima 8/10"
+            )
+
         if st.button(
-            "🚀 Generar análisis",
+            "🚀 Generar Prompt y Procesar Datos",
             type="primary",
+            use_container_width=True,
         ):
 
             with st.spinner(
-                "Consultando mercados..."
+                "Consultando The Odds API "
+                "y procesando pre-filtros..."
             ):
 
                 datos_acumulados = []
+
+                # ------------------------------------------------------
+                # TODOS LOS DEPORTES
+                # ------------------------------------------------------
 
                 if (
                     deporte_key_seleccionado
                     == "ALL"
                 ):
 
-                    progress = st.progress(
+                    progress_bar = st.progress(
                         0
                     )
 
-                    total = len(
+                    total_deps = len(
                         deportes_lista
                     )
 
@@ -2037,16 +2055,20 @@ if api_key:
                                 cuotas
                             )
 
-                        progress.progress(
+                        progress_bar.progress(
                             (idx + 1)
-                            / total
+                            / total_deps
                         )
 
                         time.sleep(
                             0.15
                         )
 
-                    progress.empty()
+                    progress_bar.empty()
+
+                # ------------------------------------------------------
+                # UN DEPORTE
+                # ------------------------------------------------------
 
                 else:
 
@@ -2057,210 +2079,169 @@ if api_key:
                         )
                     )
 
-                # --------------------------------------------------------------
-                # PREFILTRO
-                # --------------------------------------------------------------
+                # ------------------------------------------------------
+                # HORAS
+                # ------------------------------------------------------
 
-                eventos_filtrados, resumen = (
-                    filtrar_y_enriquecer(
-                        datos_acumulados
+                tz_rd = timezone(
+                    timedelta(hours=-4)
+                )
+
+                ahora_rd = datetime.now(
+                    tz_rd
+                )
+
+                ahora_utc = datetime.now(
+                    timezone.utc
+                )
+
+                hora_rd = (
+                    ahora_rd.strftime(
+                        "%Y-%m-%d %H:%M:%S "
+                        "AST (UTC-4)"
                     )
                 )
 
-                st.subheader(
-                    "📌 Prefiltro"
+                # ------------------------------------------------------
+                # FILTRAR
+                # ------------------------------------------------------
+
+                (
+                    eventos_filtrados,
+                    contador,
+                ) = filtrar_y_enriquecer(
+                    datos_acumulados,
+                    horas_ventana,
+                )
+
+                resumen_filtro = (
+                    construir_resumen_filtro(
+                        contador,
+                        horas_ventana,
+                    )
+                )
+
+                # ------------------------------------------------------
+                # MOVIMIENTOS
+                # ------------------------------------------------------
+
+                movimientos_pinnacle = (
+                    registrar_y_calcular_movimientos(
+                        eventos_filtrados,
+                        deporte_key_seleccionado,
+                    )
+                )
+
+                seccion_movimiento = (
+                    "SIN SNAPSHOT PREVIO EN ESTA SESIÓN."
+                )
+
+                if movimientos_pinnacle:
+
+                    lineas_mov = "\n".join(
+                        f"- {k}: {v}"
+                        for k, v
+                        in movimientos_pinnacle.items()
+                    )
+
+                    seccion_movimiento = (
+                        "MOVIMIENTOS EN PINNACLE "
+                        "DETECTADOS:\n"
+                        f"{lineas_mov}"
+                    )
+
+                # ------------------------------------------------------
+                # MOSTRAR RESUMEN
+                # ------------------------------------------------------
+
+                st.write(
+                    "### 📌 Resumen de Filtrado Backend"
                 )
 
                 st.info(
-                    resumen
+                    resumen_filtro
                 )
+
+                # ------------------------------------------------------
+                # CREAR PROMPT
+                # ------------------------------------------------------
 
                 if not eventos_filtrados:
 
                     st.warning(
-                        "No hay candidatos."
+                        "⚠️ No se encontraron "
+                        "candidatos válidos."
                     )
+
+                    st.session_state[
+                        "prompt_generado"
+                    ] = None
 
                 else:
 
-                    # ----------------------------------------------------------
-                    # SECONDARY MODEL ENGINE
-                    # ----------------------------------------------------------
+                    prompt_completo = (
+                        construir_prompt_final(
+                            seleccion=
+                                seleccion,
 
-                    with st.spinner(
-                        "Construyendo segundo modelo independiente..."
-                    ):
+                            hora_rd=
+                                hora_rd,
 
-                        eventos_modelados, stats = (
-                            ejecutar_secondary_model_engine(
-                                eventos_filtrados
-                            )
+                            ahora_utc=
+                                ahora_utc,
+
+                            resumen_filtro=
+                                resumen_filtro,
+
+                            seccion_movimiento=
+                                seccion_movimiento,
+
+                            eventos_filtrados=
+                                eventos_filtrados,
                         )
-
-                    st.subheader(
-                        "🧠 Secondary Model Engine"
                     )
 
-                    c1, c2, c3, c4 = st.columns(4)
+                    st.session_state[
+                        "prompt_generado"
+                    ] = prompt_completo
 
-                    c1.metric(
-                        "Candidatos",
-                        stats["eventos"],
+                    st.session_state[
+                        "eventos_filtrados"
+                    ] = eventos_filtrados
+
+                    st.success(
+                        "✅ Se consolidaron "
+                        f"{len(eventos_filtrados)} "
+                        "eventos aptos para el prompt."
                     )
-
-                    c2.metric(
-                        "Modelo verificado",
-                        stats["verified"],
-                    )
-
-                    c3.metric(
-                        "Sin modelo",
-                        stats["unverified"],
-                    )
-
-                    c4.metric(
-                        "Histórico insuficiente",
-                        stats[
-                            "historico_insuficiente"
-                        ],
-                    )
-
-                    if not eventos_modelados:
-
-                        st.warning(
-                            "⚠️ Ningún evento tiene "
-                            "un segundo modelo suficientemente "
-                            "validado. Se genera PICK DEL DÍA: NINGUNO."
-                        )
-
-                        st.session_state[
-                            "prompt_generado"
-                        ] = (
-                            SYSTEM_PROMPT_BLINDADO_V4
-                            + "\n\n"
-                            + "PICK DEL DÍA: NINGUNO"
-                        )
-
-                    else:
-
-                        # ------------------------------------------------------
-                        # MOVIMIENTOS
-                        # ------------------------------------------------------
-
-                        movimientos = (
-                            registrar_y_calcular_movimientos(
-                                eventos_modelados,
-                                deporte_key_seleccionado,
-                            )
-                        )
-
-                        if movimientos:
-
-                            movimiento_texto = (
-                                "MOVIMIENTOS PINNACLE:\n"
-                                + "\n".join(
-                                    f"- {k}: {v}"
-                                    for k, v in movimientos.items()
-                                )
-                            )
-
-                        else:
-
-                            movimiento_texto = (
-                                "SIN SNAPSHOT PREVIO "
-                                "EN ESTA SESIÓN."
-                            )
-
-                        # ------------------------------------------------------
-                        # HORA RD
-                        # ------------------------------------------------------
-
-                        tz_rd = timezone(
-                            timedelta(
-                                hours=-4
-                            )
-                        )
-
-                        hora_rd = (
-                            datetime.now(
-                                tz_rd
-                            ).strftime(
-                                "%Y-%m-%d %H:%M:%S "
-                                "AST (UTC-4)"
-                            )
-                        )
-
-                        # ------------------------------------------------------
-                        # PROMPT FINAL
-                        # ------------------------------------------------------
-
-                        prompt_completo = (
-
-                            f"{SYSTEM_PROMPT_BLINDADO_V4}\n\n"
-
-                            "==================================================\n"
-                            "CONTEXTO DE EJECUCIÓN\n"
-                            "==================================================\n\n"
-
-                            f"ÁMBITO: {seleccion}\n"
-
-                            f"HORA CONSULTA RD: "
-                            f"{hora_rd}\n\n"
-
-                            f"RESUMEN PREFILTRO:\n"
-                            f"{resumen}\n\n"
-
-                            f"{movimiento_texto}\n\n"
-
-                            "INSTRUCCIÓN TÉCNICA:\n"
-                            "Utiliza directamente:\n"
-                            "- `_pinnacle_devig`\n"
-                            "- `_pinnacle_last_update`\n"
-                            "- `_liquidez_backend`\n"
-                            "- `_dispersion_max_entre_casas`\n"
-                            "- `_n_casas_reportando`\n"
-                            "- `_secondary_model`\n\n"
-
-                            "NO recalcules el de-vig.\n"
-                            "NO construyas otro segundo modelo.\n\n"
-
-                            "DATOS JSON:\n"
-
-                            + json.dumps(
-                                eventos_modelados,
-                                indent=2,
-                                ensure_ascii=False,
-                            )
-                        )
-
-                        st.session_state[
-                            "prompt_generado"
-                        ] = prompt_completo
-
-                        st.success(
-                            f"✅ {len(eventos_modelados)} "
-                            f"eventos con segundo modelo "
-                            f"verificado."
-                        )
 
 
 # ==============================================================================
-# EJECUCIÓN IA
+# RESULTADO / PROMPT
 # ==============================================================================
 
 if (
     "prompt_generado"
     in st.session_state
+    and st.session_state[
+        "prompt_generado"
+    ]
 ):
 
     st.divider()
 
     st.subheader(
-        "🤖 Ejecutar análisis"
+        "🤖 Selecciona la IA"
     )
 
-    col1, col2, col3, col4, col5 = (
-        st.columns(5)
+    st.caption(
+        "Los botones web permiten pegar el mismo prompt "
+        "en distintas IAs. Las ejecuciones directas de "
+        "Gemini y Claude incorporan búsqueda web."
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(
+        5
     )
 
     with col1:
@@ -2282,7 +2263,7 @@ if (
     with col3:
 
         st.link_button(
-            "🌐 Gemini",
+            "🌐 Gemini Web",
             "https://gemini.google.com",
             use_container_width=True,
         )
@@ -2303,8 +2284,12 @@ if (
             use_container_width=True,
         )
 
-    st.subheader(
-        "📋 Prompt generado"
+    # --------------------------------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------------------------------
+
+    st.write(
+        "#### 📋 Prompt generado"
     )
 
     st.code(
@@ -2314,152 +2299,266 @@ if (
         language="markdown",
     )
 
+    # ==========================================================================
+    # GEMINI API
+    # ==========================================================================
 
-# ==============================================================================
-# GEMINI DIRECTO
-# ==============================================================================
+    if gemini_api_key:
 
-if gemini_api_key and (
-    "prompt_generado"
-    in st.session_state
-):
+        st.divider()
 
-    st.divider()
-
-    st.subheader(
-        "⚡ Gemini API"
-    )
-
-    modelos = listar_modelos_gemini(
-        gemini_api_key
-    )
-
-    if modelos:
-
-        modelo_default = next(
-            (
-                m
-                for m in modelos
-                if "flash" in m
-                and "lite" not in m
-            ),
-            modelos[0],
+        st.subheader(
+            "⚡ Gemini API — Web Search activo"
         )
 
-        modelo = st.selectbox(
-            "Modelo Gemini:",
-            modelos,
-            index=modelos.index(
-                modelo_default
-            ),
+        st.caption(
+            "La ejecución directa de Gemini utiliza "
+            "Google Search grounding para investigar "
+            "las fuentes externas exigidas por el Model Registry."
         )
 
-        if st.button(
-            "🤖 Analizar con Gemini",
-            type="primary",
-        ):
+        modelos_disponibles = (
+            listar_modelos_gemini(
+                gemini_api_key
+            )
+        )
 
-            with st.spinner(
-                "Analizando..."
+        if modelos_disponibles:
+
+            modelo_default = next(
+                (
+                    m
+                    for m
+                    in modelos_disponibles
+                    if (
+                        "flash" in m.lower()
+                        and "lite"
+                        not in m.lower()
+                    )
+                ),
+                modelos_disponibles[0],
+            )
+
+            modelo_elegido = (
+                st.selectbox(
+                    "Modelo Gemini:",
+                    modelos_disponibles,
+                    index=
+                        modelos_disponibles.index(
+                            modelo_default
+                        ),
+                )
+            )
+
+            if st.button(
+                "🤖 Analizar directamente con Gemini API",
+                type="primary",
+                use_container_width=True,
             ):
 
-                try:
+                with st.spinner(
+                    f"Analizando con "
+                    f"{modelo_elegido} "
+                    "y búsqueda web..."
+                ):
 
-                    resultado, uso = (
-                        llamar_gemini_rest(
+                    try:
+
+                        (
+                            resultado,
+                            uso,
+                            grounding,
+                        ) = llamar_gemini_rest(
                             gemini_api_key,
-                            modelo,
+                            modelo_elegido,
                             st.session_state[
                                 "prompt_generado"
                             ],
                         )
-                    )
 
-                    st.subheader(
-                        "🏆 Resultado"
-                    )
+                        st.markdown(
+                            "### 🏆 Resultado Gemini"
+                        )
 
-                    st.markdown(
-                        resultado
-                    )
+                        st.markdown(
+                            resultado
+                        )
 
-                except Exception as e:
+                        if uso:
 
-                    st.error(
-                        f"Error Gemini: {e}"
-                    )
+                            with st.expander(
+                                "📊 Uso reportado por Gemini"
+                            ):
+
+                                st.json(
+                                    uso
+                                )
+
+                        if grounding:
+
+                            with st.expander(
+                                "🔎 Metadatos de búsqueda / grounding"
+                            ):
+
+                                st.json(
+                                    grounding
+                                )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Error al ejecutar "
+                            f"Gemini API: {e}"
+                        )
+
+        else:
+
+            st.warning(
+                "No se pudo obtener la lista "
+                "de modelos Gemini."
+            )
 
 
-# ==============================================================================
-# CLAUDE DIRECTO
-# ==============================================================================
+    # ==========================================================================
+    # CLAUDE API
+    # ==========================================================================
 
-if anthropic_api_key and (
-    "prompt_generado"
-    in st.session_state
-):
+    if anthropic_api_key:
 
-    st.divider()
+        st.divider()
 
-    st.subheader(
-        "⚡ Claude API"
-    )
-
-    modelos = listar_modelos_claude(
-        anthropic_api_key
-    )
-
-    if modelos:
-
-        modelo_default = next(
-            (
-                m
-                for m in modelos
-                if "sonnet"
-                in m.lower()
-            ),
-            modelos[0],
+        st.subheader(
+            "⚡ Claude API — Web Search activo"
         )
 
-        modelo = st.selectbox(
-            "Modelo Claude:",
-            modelos,
-            index=modelos.index(
-                modelo_default
-            ),
+        st.caption(
+            "La llamada incluye el server-side web_search "
+            "directamente en la API y maneja automáticamente "
+            "los turnos pausados de búsqueda."
         )
 
-        if st.button(
-            "🤖 Analizar con Claude",
-            type="primary",
-        ):
+        modelos_claude = (
+            listar_modelos_claude(
+                anthropic_api_key
+            )
+        )
 
-            with st.spinner(
-                "Analizando..."
+        if modelos_claude:
+
+            modelo_claude_default = next(
+                (
+                    m
+                    for m
+                    in modelos_claude
+                    if "sonnet"
+                    in m.lower()
+                ),
+                modelos_claude[0],
+            )
+
+            modelo_claude_elegido = (
+                st.selectbox(
+                    "Modelo Claude:",
+                    modelos_claude,
+                    index=
+                        modelos_claude.index(
+                            modelo_claude_default
+                        ),
+                )
+            )
+
+            if st.button(
+                "🤖 Analizar directamente con Claude API",
+                type="primary",
+                use_container_width=True,
             ):
 
-                try:
+                with st.spinner(
+                    f"Analizando con "
+                    f"{modelo_claude_elegido} "
+                    "y búsqueda web..."
+                ):
 
-                    resultado = (
-                        llamar_claude_rest(
+                    try:
+
+                        (
+                            resultado,
+                            queries_buscadas,
+                            uso,
+                        ) = llamar_claude_rest(
                             anthropic_api_key,
-                            modelo,
+                            modelo_claude_elegido,
                             st.session_state[
                                 "prompt_generado"
                             ],
                         )
-                    )
 
-                    st.subheader(
-                        "🏆 Resultado"
-                    )
+                        st.markdown(
+                            "### 🏆 Resultado Claude"
+                        )
 
-                    st.markdown(
-                        resultado
-                    )
+                        st.markdown(
+                            resultado
+                        )
 
-                except Exception as e:
+                        if queries_buscadas:
 
-                    st.error(
-                        f"Error Claude: {e}"
-                    )
+                            with st.expander(
+                                "🔍 Búsquedas web realizadas "
+                                f"({len(queries_buscadas)})"
+                            ):
+
+                                for q in queries_buscadas:
+
+                                    st.write(
+                                        f"- {q}"
+                                    )
+
+                        else:
+
+                            st.warning(
+                                "⚠️ Claude no registró "
+                                "búsquedas web en esta corrida."
+                            )
+
+                        if uso:
+
+                            with st.expander(
+                                "📊 Uso reportado por Claude"
+                            ):
+
+                                st.json(
+                                    uso
+                                )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Error al ejecutar "
+                            f"Claude API: {e}"
+                        )
+
+        else:
+
+            st.warning(
+                "No se pudo obtener la lista "
+                "de modelos Claude."
+            )
+
+
+# ==============================================================================
+# PIE
+# ==============================================================================
+
+st.divider()
+
+st.caption(
+    "Analista Cuantitativo de Apuesta Única "
+    "— Blindado v3.2"
+)
+
+st.caption(
+    "0 picks es un resultado válido. "
+    "El sistema prioriza evitar falsos positivos "
+    "antes que forzar una apuesta."
+)
