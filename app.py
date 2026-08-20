@@ -44,11 +44,20 @@ METODOLOGÍA Y REGLAS CLAVE:
    - Tenis (ATP/WTA): TennisAbstract (Elo por superficie) o ranking oficial ATP/WTA
      como referencia secundaria.
    - MLB: FanGraphs (proyecciones de equipo / pitcher matchup).
-   - NBA/NCAAMB: Basketball-Reference (SRS o ratings ofensivo/defensivo).
+   - NBA/WNBA/NCAAMB: Basketball-Reference (SRS o ratings ofensivo/defensivo).
    - NHL: Hockey-Reference (SRS).
-   Debes buscar esta fuente vía web search REAL y citar la URL exacta consultada.
-   Si no puedes verificar el segundo modelo para un evento, ese evento queda
-   automáticamente descartado (no se asume, no se estima, no se inventa).
+   - Cricket (incl. CPLT20 y otras ligas T20): ratings de equipo ICC o el sistema de
+     ratings de ESPN Cricinfo.
+   - NFL Preseason / partidos de exhibición o amistosos de cualquier deporte:
+     EXCLUIR directamente del análisis, sin intentar segundo modelo. Estos partidos
+     usan roster de reserva y rotaciones irregulares — no son estadísticamente
+     comparables a temporada regular y no califican para este sistema.
+
+   OBLIGATORIO: para cada evento debes REALIZAR la búsqueda web real de la fuente
+   correspondiente ANTES de concluir que no se puede verificar. No está permitido
+   responder "no se puede confirmar" sin haber intentado la búsqueda. Si tras
+   buscar genuinamente no encuentras el dato, entonces sí descarta ese evento
+   puntual y dilo explícitamente ("se buscó en [fuente], sin resultado verificable").
 
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
 
@@ -86,6 +95,8 @@ FORMATO DE SALIDA (obligatorio, en español):
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
+ANTHROPIC_VERSION = "2023-06-01"
 
 # ==============================================================================
 # 2. FUNCIONES BACKEND
@@ -349,6 +360,66 @@ def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
 
 
 # ==============================================================================
+# 3b. CLAUDE (Anthropic) — búsqueda web FORZADA vía tool en la propia llamada.
+#     Esto no depende de ningún toggle de interfaz: el tool viaja en el request.
+# ==============================================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def listar_modelos_claude(anthropic_api_key):
+    """Consulta /v1/models en vivo — misma lógica que con Gemini, para nunca
+    depender de un nombre de modelo hardcodeado que se vuelva obsoleto."""
+    url = f"{ANTHROPIC_API_BASE}/models"
+    headers = {
+        "x-api-key": anthropic_api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        modelos = r.json().get("data", [])
+        # Excluye modelos legacy/no aptos para este uso si vinieran marcados
+        ids = [m.get("id") for m in modelos if m.get("id")]
+        return ids
+    except Exception as e:
+        st.error(f"No se pudo obtener la lista de modelos de Claude: {e}")
+        return []
+
+
+def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096):
+    """
+    Llama a la API de Claude con el tool de web_search FORZADO en el propio
+    request. Al viajar dentro del payload de la llamada, esto NO depende de
+    ningún toggle manual de interfaz — el modelo puede buscar aunque el
+    equivalente en claude.ai no tuviera el buscador activado.
+    """
+    url = f"{ANTHROPIC_API_BASE}/messages"
+    headers = {
+        "x-api-key": anthropic_api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    body = {
+        "model": modelo,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt_texto}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+
+    # La respuesta puede traer varios bloques: texto, uso de la herramienta y
+    # resultados de búsqueda. Solo unimos los bloques de tipo "text".
+    partes_texto = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+    fuentes_buscadas = [
+        b.get("input", {}).get("query")
+        for b in data.get("content", [])
+        if b.get("type") == "server_tool_use" and b.get("name") == "web_search"
+    ]
+    return "\n\n".join(partes_texto), [q for q in fuentes_buscadas if q]
+
+
+# ==============================================================================
 # 4. INTERFAZ
 # ==============================================================================
 
@@ -364,6 +435,10 @@ with st.sidebar:
     gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
     if not gemini_api_key:
         gemini_api_key = st.text_input("Gemini API Key (Opcional):", type="password")
+
+    anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_api_key:
+        anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
 
     if "odds_api_uso" in st.session_state:
         uso = st.session_state["odds_api_uso"]
@@ -479,3 +554,46 @@ if api_key:
                             st.error(f"Error al ejecutar con Gemini API: {e}")
             else:
                 st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Gemini.")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Claude API — búsqueda forzada)")
+            st.caption(
+                "Esta llamada incluye el tool `web_search` directamente en el request, "
+                "así que Claude SÍ puede buscar en ClubElo/FanGraphs/TennisAbstract "
+                "aunque el toggle de búsqueda en claude.ai estuviera apagado — el tool "
+                "no depende de ninguna configuración de interfaz."
+            )
+
+            modelos_claude = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude:
+                modelo_claude_default = next(
+                    (m for m in modelos_claude if "sonnet" in m.lower()), modelos_claude[0]
+                )
+                modelo_claude_elegido = st.selectbox(
+                    "Modelo Claude (lista obtenida en vivo desde la API):",
+                    modelos_claude,
+                    index=modelos_claude.index(modelo_claude_default),
+                )
+                if st.button("🤖 Analizar directamente con Claude API", type="primary"):
+                    with st.spinner(f"Analizando con {modelo_claude_elegido} (con búsqueda web activa)..."):
+                        try:
+                            resultado, queries_buscadas = llamar_claude_rest(
+                                anthropic_api_key, modelo_claude_elegido, st.session_state["prompt_generado"]
+                            )
+                            st.markdown("### 🏆 Resultado del Análisis")
+                            st.markdown(resultado)
+                            if queries_buscadas:
+                                with st.expander(f"🔍 Búsquedas web realizadas ({len(queries_buscadas)})"):
+                                    for q in queries_buscadas:
+                                        st.write(f"- {q}")
+                            else:
+                                st.warning(
+                                    "⚠️ Claude no ejecutó ninguna búsqueda web en esta corrida — "
+                                    "revisa el resultado, es posible que haya descartado todo por "
+                                    "falta de datos verificables en vez de fabricarlos."
+                                )
+                        except Exception as e:
+                            st.error(f"Error al ejecutar con Claude API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
