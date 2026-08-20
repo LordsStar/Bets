@@ -38,26 +38,20 @@ METODOLOGÍA Y REGLAS CLAVE:
    Registra en el resumen cuántos eventos cayeron específicamente por este gate
    (distinto de "sin segundo modelo" o "fuera de umbral EV").
 
-3. VALIDACIÓN CRUZADA (Segundo Modelo) — fuente específica por deporte, NO genérica:
-   - Fútbol (soccer): ClubElo (ratings Elo) o el modelo SPI/Elo de FiveThirtyEight
-     si está disponible.
-   - Tenis (ATP/WTA): TennisAbstract (Elo por superficie) o ranking oficial ATP/WTA
-     como referencia secundaria.
-   - MLB: FanGraphs (proyecciones de equipo / pitcher matchup).
-   - NBA/WNBA/NCAAMB: Basketball-Reference (SRS o ratings ofensivo/defensivo).
-   - NHL: Hockey-Reference (SRS).
-   - Cricket (incl. CPLT20 y otras ligas T20): ratings de equipo ICC o el sistema de
-     ratings de ESPN Cricinfo.
-   - NFL Preseason / partidos de exhibición o amistosos de cualquier deporte:
-     EXCLUIR directamente del análisis, sin intentar segundo modelo. Estos partidos
-     usan roster de reserva y rotaciones irregulares — no son estadísticamente
-     comparables a temporada regular y no califican para este sistema.
-
-   OBLIGATORIO: para cada evento debes REALIZAR la búsqueda web real de la fuente
-   correspondiente ANTES de concluir que no se puede verificar. No está permitido
-   responder "no se puede confirmar" sin haber intentado la búsqueda. Si tras
-   buscar genuinamente no encuentras el dato, entonces sí descarta ese evento
-   puntual y dilo explícitamente ("se buscó en [fuente], sin resultado verificable").
+3. VALIDACIÓN CRUZADA (Segundo Modelo) — EXCLUSIVAMENTE vía Model Registry:
+   Cada evento trae un campo `_registry_modelo_secundario` con la fuente autorizada
+   para ese deporte. Reglas ESTRICTAS:
+   - Si `cobertura` = "externa_directa": debes REALIZAR la búsqueda web real en
+     `fuente_primaria` (o `fuente_secundaria` si la primaria falla) ANTES de
+     concluir que no se puede verificar. Prohibido responder "no se puede
+     confirmar" sin haber intentado la búsqueda.
+   - Si `cobertura` = "pendiente_desarrollo": el evento NO tiene fuente autorizada
+     todavía. Descarta automáticamente SIN intentar buscar en otro lado ni usar
+     un modelo "propio" improvisado — eso sería fabricación.
+   - Si `cobertura` = "excluido_estructural" (ya debería venir excluido del JSON,
+     pero por seguridad): descarta sin análisis.
+   - PROHIBIDO ABSOLUTO: usar cualquier fuente, rating o modelo que no aparezca
+     literalmente en `_registry_modelo_secundario` de ese evento específico.
 
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
 
@@ -97,6 +91,71 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# ==============================================================================
+# 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
+#     Esto SÍ vive en código (versionado, editable), no en el prompt.
+#     "cobertura":
+#       - "externa_directa"      → hay fuente pública conocida, la IA debe buscarla.
+#       - "pendiente_desarrollo" → sin fuente confiable todavía. Se descarta, NO
+#                                  se le pide a la IA que "invente" un modelo propio.
+#       - "excluido_estructural" → se excluye antes de llegar a la IA (ej. preseason).
+#     REGISTRY_ULTIMA_REVISION: actualízala a mano cuando edites este bloque.
+# ==============================================================================
+REGISTRY_ULTIMA_REVISION = "2026-08-20"
+
+MODEL_REGISTRY = [
+    {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "excluido_estructural", "version": "1.0"},
+    {"patron": "soccer", "fuente_primaria": "ClubElo", "fuente_secundaria": "FiveThirtyEight SPI",
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
+     "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "0.0"},
+    {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "0.0"},
+    {"patron": "basketball_nba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "basketball_wnba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "basketball_ncaab", "fuente_primaria": "Basketball-Reference (NCAA)", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "icehockey_nhl", "fuente_primaria": "Hockey-Reference", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "cricket", "fuente_primaria": "ICC Team Ratings", "fuente_secundaria": "ESPN Cricinfo",
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "boxing", "fuente_primaria": "BoxRec ratings", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0"},
+    {"patron": "mma", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "0.0"},
+    {"patron": "americanfootball_nfl", "fuente_primaria": "ESPN FPI (Football Power Index)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0"},
+]
+
+DEFAULT_REGISTRY_ENTRY = {
+    "fuente_primaria": None, "fuente_secundaria": None,
+    "cobertura": "pendiente_desarrollo", "version": "0.0",
+}
+
+
+def obtener_entrada_registry(sport_key):
+    """Busca la entrada del Model Registry para un sport_key dado.
+    Recorre en orden -> el primer patrón que matchea gana (por eso preseason
+    va antes que el patrón genérico de NFL)."""
+    if not sport_key:
+        entrada = dict(DEFAULT_REGISTRY_ENTRY)
+    else:
+        sport_key_low = sport_key.lower()
+        entrada = next(
+            (e for e in MODEL_REGISTRY if e["patron"] in sport_key_low),
+            dict(DEFAULT_REGISTRY_ENTRY),
+        )
+    entrada = dict(entrada)
+    entrada["ultima_revision"] = REGISTRY_ULTIMA_REVISION
+    return entrada
 
 # ==============================================================================
 # 2. FUNCIONES BACKEND
@@ -241,12 +300,20 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
     descartados_fuera_de_rango = 0
     descartados_fecha = 0
     descartados_sin_fecha = 0
+    descartados_exclusion_estructural = 0
+    eventos_pendientes_desarrollo = 0
 
     ahora_utc = datetime.now(timezone.utc)
     limite_utc = ahora_utc + timedelta(hours=horas_ventana)
 
     for evento in datos_crudos:
         if not isinstance(evento, dict):
+            continue
+
+        registry_entry = obtener_entrada_registry(evento.get("sport_key"))
+        if registry_entry["cobertura"] == "excluido_estructural":
+            # Se excluye aquí mismo, sin gastar tokens de IA intentándolo.
+            descartados_exclusion_estructural += 1
             continue
 
         commence_str = evento.get("commence_time")
@@ -293,9 +360,13 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
 
         cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
 
+        if registry_entry["cobertura"] == "pendiente_desarrollo":
+            eventos_pendientes_desarrollo += 1
+
         evento_minificado = {
             "id": evento.get("id"),
             "deporte": evento.get("sport_title") or evento.get("sport_key"),
+            "sport_key": evento.get("sport_key"),
             "partido": f"{evento.get('home_team')} vs {evento.get('away_team')}",
             "inicio_utc": commence_str,
             "cuotas_pinnacle": cuotas_pinnacle,
@@ -304,6 +375,7 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
             "_liquidez_backend": liquidez,
             "_dispersion_max_entre_casas": round(dispersion, 4),
             "_n_casas_reportando": n_bookmakers,
+            "_registry_modelo_secundario": registry_entry,
         }
         eventos_validos.append(evento_minificado)
 
@@ -313,7 +385,10 @@ def filtrar_y_enriquecer(datos_crudos, horas_ventana=24):
         f"{descartados_fecha} descartados por fecha fuera de ventana, "
         f"{descartados_sin_fecha} descartados por fecha faltante/ilegible, "
         f"{descartados_sin_pinnacle} descartados sin Pinnacle, "
-        f"{descartados_fuera_de_rango} descartados fuera de rango de cuota."
+        f"{descartados_fuera_de_rango} descartados fuera de rango de cuota, "
+        f"{descartados_exclusion_estructural} excluidos estructuralmente (preseason/exhibición), "
+        f"de los cuales {eventos_pendientes_desarrollo} quedan SIN fuente de segundo modelo "
+        f"(cobertura 'pendiente_desarrollo' en el Model Registry — la IA los descartará)."
     )
     return eventos_validos, resumen_filtro
 
@@ -348,7 +423,10 @@ def listar_modelos_gemini(gemini_api_key):
 
 def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
     """Llamada REST directa (evita depender del SDK, que se desactualiza con
-    cada modelo nuevo)."""
+    cada modelo nuevo). Devuelve también el uso de tokens que Gemini reporta
+    en 'usageMetadata' dentro del cuerpo de la respuesta.
+    NOTA: Google no expone el saldo/crédito restante de la cuenta por esta vía
+    — eso solo se ve en el dashboard de Google AI Studio / Cloud Console."""
     url = f"{GEMINI_API_BASE}/models/{modelo}:generateContent"
     headers = {"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"}
     body = {"contents": [{"parts": [{"text": prompt_texto}]}]}
@@ -356,7 +434,9 @@ def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
     r.raise_for_status()
     data = r.json()
     partes = data["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in partes)
+    texto = "".join(p.get("text", "") for p in partes)
+    uso = data.get("usageMetadata", {})
+    return texto, uso
 
 
 # ==============================================================================
