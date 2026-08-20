@@ -13,7 +13,7 @@ import streamlit as st
 #    segundo modelo válido, reglas anti-fabricación y formato de salida fijo.
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_2 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.2)
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.3)
 
 ROL Y OBJETIVO:
 Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
@@ -37,7 +37,6 @@ METODOLOGÍA Y REGLAS CLAVE:
      desactualizado cerca del cierre del mercado → DESCARTA el evento.
    - Si al evento le faltan MÁS de 3 horas, la antigüedad de `_pinnacle_last_update`
      es solo informativa: NO descartes el evento por este motivo.
-   Registra en el resumen cuántos eventos cayeron específicamente por este gate.
 
 3. VALIDACIÓN CRUZADA (Segundo Modelo) — EXCLUSIVAMENTE vía Model Registry:
    Cada evento trae `_registry_modelo_secundario` con la fuente autorizada para
@@ -68,11 +67,12 @@ METODOLOGÍA Y REGLAS CLAVE:
    literalmente en `_registry_modelo_secundario` de ese evento específico.
 
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
+   Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
 
-5. UMBRALES DE DESCARTE:
-   - EV < 5% → descartar.
-   - Divergencia |Pinnacle - Segundo Modelo| > 7% → descartar (señal de posible
-     error de datos, no de "value").
+5. UMBRALES DE DESCARTE (ajustados v3.3 — ligeramente más permisivos que v3.2):
+   - EV < 4% → descartar (antes 5%).
+   - Divergencia |Pinnacle - Segundo Modelo| > 9% → descartar (antes 7%; señal
+     de posible error de datos, no de "value").
    - Si el segundo modelo es "modelo_interno_elo" y `brier_score_historico` es
      peor que 0.23 o `muestras_brier` < 8, el backend ya lo habría excluido —
      pero si por alguna razón lo ves con esos valores, descarta igual.
@@ -95,15 +95,33 @@ REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
 - Cada afirmación estadística debe llevar su fuente (nombre + URL, o "Modelo Elo
   interno" con sus métricas si aplica).
 
+CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (nuevo en v3.3):
+Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
+de prioridad (aplica la primera que corresponda y detente ahí, no evalúes las
+siguientes para ese evento):
+   1º Gate de frescura (regla 2)
+   2º Segundo modelo no disponible — "pendiente_desarrollo" (regla 3)
+   3º Liquidez insuficiente — menos de 2 casas (regla 4)
+   4º EV por debajo del umbral (regla 5)
+   5º Divergencia por encima del umbral (regla 5)
+   6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
+Un evento NUNCA debe contarse en dos categorías a la vez.
+
+AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
+Suma (eventos por cada categoría de descarte) + (1 si hay pick, 0 si no) debe
+ser EXACTAMENTE igual al número total de eventos evaluados que recibiste en el
+JSON. Si no cuadra, revisa tu categorización y corrígela antes de responder —
+no entregues un informe con números que no concilien.
+
 FORMATO DE SALIDA (obligatorio, en español):
-1. Resumen: cuántos eventos se evaluaron, cuántos se descartaron y por qué
-   (agrupado por motivo: sin segundo modelo, datos obsoletos, fuera de umbral
-   EV, divergencia).
+1. Resumen: cuántos eventos se evaluaron y el desglose EXACTO por categoría
+   (las 6 de arriba), con la verificación de que suman el total.
 2. Si hay pick: Partido | Mercado | Cuota Pinnacle | Prob. implícita de-vigged |
    Prob. segundo modelo (con fuente/métricas) | EV% | Confianza (con desglose) |
    Justificación en 3-4 líneas.
 3. Si NO hay pick: decirlo explícitamente en la primera línea ("PICK DEL DÍA:
-   NINGUNO") y explicar brevemente por qué ningún evento alcanzó el umbral.
+   NINGUNO") y explicar brevemente, por categoría, por qué ningún evento
+   alcanzó el umbral.
 """
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -718,7 +736,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.2 (Multi-IA, Multi-Deporte & Motor Elo Interno)")
+st.title("📊 Analista de Apuesta Única v3.3 (Multi-IA, Multi-Deporte & Motor Elo Interno)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
