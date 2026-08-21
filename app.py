@@ -7,14 +7,19 @@ import requests
 import streamlit as st
 
 # ==============================================================================
-# 1. SYSTEM PROMPT V3.3 — BLINDADO
+# 1. SYSTEM PROMPT V3.4 — BLINDADO
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
 #    relativo, Model Registry obligatorio, motor Elo interno calibrado como
 #    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
-#    y ahora también tabla de transparencia con los descartes (EV/divergencia).
+#    tabla de transparencia de descartes (v3.3), y ahora (v3.4):
+#      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
+#      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
+#        registry) para cuando la fuente primaria no expone un número público.
+#      - Sección de salida "CASI CALIFICÓ" con los eventos más cercanos al
+#        umbral que no pasaron.
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_2 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.3)
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.4)
 
 ROL Y OBJETIVO:
 Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
@@ -47,6 +52,20 @@ METODOLOGÍA Y REGLAS CLAVE:
      (o `fuente_secundaria` si la primaria falla) ANTES de concluir que no se
      puede verificar. Prohibido responder "no se puede confirmar" sin haber
      intentado la búsqueda.
+     - RESPALDO DOCUMENTADO (nuevo en v3.4): si ni `fuente_primaria` ni
+       `fuente_secundaria` exponen un número públicamente accesible tras un
+       intento real de búsqueda, revisa si el evento trae un campo
+       `fuente_respaldo` en el registry. Si existe, puedes usarlo — pero
+       cítalo EXPLÍCITAMENTE como respaldo, nunca como si fuera la fuente
+       primaria. Ejemplo correcto: "Fuente: ESPN Analytics — Matchup
+       Predictor (respaldo documentado; FanGraphs no expuso un número
+       público tras la búsqueda)".
+     - Si NO hay `fuente_respaldo` documentada y ninguna de las fuentes
+       oficiales dio un número verificable, el evento se descarta en la
+       categoría 2 (segundo modelo no disponible), con nota "fuente primaria
+       inaccesible, sin respaldo documentado". PROHIBIDO improvisar o
+       sustituir con una fuente no listada en el registry ni en su campo
+       `fuente_respaldo`.
 
    - "modelo_interno_elo": el backend YA calculó una probabilidad calibrada con
      resultados reales recientes (no es una fuente web). Usa directamente los
@@ -65,7 +84,23 @@ METODOLOGÍA Y REGLAS CLAVE:
      descarta sin análisis (partidos de exhibición/preseason).
 
    PROHIBIDO ABSOLUTO: usar cualquier fuente, rating o modelo que no aparezca
-   literalmente en `_registry_modelo_secundario` de ese evento específico.
+   literalmente en `_registry_modelo_secundario` de ese evento específico
+   (ya sea en `fuente_primaria`, `fuente_secundaria`, o `fuente_respaldo`).
+
+3b. CHEQUEO DE ESTADO FÍSICO — OBLIGATORIO PARA TENIS, BOXEO Y MMA (nuevo en v3.4):
+   Además de la fuente de rating (TennisAbstract, BoxRec, etc.), para estos tres
+   deportes DEBES hacer una búsqueda web adicional específica sobre noticias
+   recientes (últimas 48-72h) de lesión, retiro, molestia física, o estado de
+   forma del competidor. Un rating Elo o ranking NO captura esto — solo refleja
+   resultados pasados, no el estado físico actual.
+   - Si encuentras una noticia real y citable de lesión/molestia/duda física
+     relevante que el rating no puede haber incorporado todavía, esto reduce
+     la Confianza (regla 6) de forma explícita, aunque EV y divergencia pasen
+     los umbrales. Nunca ignores esta señal solo porque el EV se ve atractivo.
+   - Si no encuentras nada relevante tras la búsqueda, decláralo explícitamente
+     en el informe (ej. "Sin noticias de lesión/estado físico en las últimas
+     72h según [fuente/búsqueda]") — la ausencia de hallazgos debe quedar
+     documentada, no asumida.
 
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
    Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
@@ -81,9 +116,13 @@ METODOLOGÍA Y REGLAS CLAVE:
 6. CONFIANZA (1-10): Calcula con el siguiente desglose visible en el informe:
    - Edge estadístico (EV real vs. umbral)
    - Calidad/frescura de la fuente del segundo modelo (una fuente externa
-     reciente pesa más que un modelo interno con pocas muestras)
+     reciente pesa más que un modelo interno con pocas muestras; una fuente
+     de respaldo documentada pesa menos que la fuente primaria oficial)
    - Liquidez del mercado
    - Coherencia entre movimiento de línea (si hay datos) y el pick
+   - Para tenis/boxeo/MMA: resultado del chequeo de estado físico (regla 3b).
+     Una noticia real de lesión/molestia no cuantificable en el rating debe
+     bajar este componente de forma explícita.
    Un pick solo califica si la confianza total es >= 8/10.
 
 REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
@@ -93,23 +132,30 @@ REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
   no estén en el JSON de entrada o en una fuente web verificada.
 - Si falta cualquier dato necesario para completar el análisis de un evento, ese
   evento se descarta — nunca se rellena el vacío con una suposición "razonable".
-- Cada afirmación estadística debe llevar su fuente (nombre + URL, o "Modelo Elo
-  interno" con sus métricas si aplica).
+- Cada afirmación estadística debe llevar su fuente (nombre + URL, "Modelo Elo
+  interno" con sus métricas si aplica, o la fuente de respaldo citada como tal).
 - Si un evento se descartó en la categoría 1, 2 o 3 (frescura, pendiente_desarrollo
-  o liquidez), NUNCA calcules ni inventes un EV% o divergencia% para él — en esos
-  casos ni siquiera se llegó a evaluar el segundo modelo. Repórtalo como "N/A — no
-  se calculó" en la tabla de la sección de salida 4.
+  /fuente inaccesible sin respaldo, o liquidez), NUNCA calcules ni inventes un EV%
+  o divergencia% para él — en esos casos ni siquiera se llegó a evaluar el segundo
+  modelo. Repórtalo como "N/A — no se calculó" en la tabla de la sección 4.
+- El campo `fuente_respaldo` NUNCA se usa por comodidad o para ahorrar una
+  búsqueda — solo se usa después de haber intentado realmente la fuente primaria
+  y, si aplica, la secundaria, y haber confirmado que ninguna expone un número
+  público.
 
-CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (nuevo en v3.3):
+CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (v3.3, ajustada en v3.4):
 Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
 de prioridad (aplica la primera que corresponda y detente ahí, no evalúes las
 siguientes para ese evento):
    1º Gate de frescura (regla 2)
-   2º Segundo modelo no disponible — "pendiente_desarrollo" (regla 3)
+   2º Segundo modelo no disponible — "pendiente_desarrollo" O "externa_directa"
+      sin fuente primaria/secundaria accesible NI `fuente_respaldo` documentada
+      (regla 3)
    3º Liquidez insuficiente — menos de 2 casas (regla 4)
    4º EV por debajo del umbral (regla 5)
    5º Divergencia por encima del umbral (regla 5)
    6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
+      (incluye el caso de una señal de estado físico no cuantificable, regla 3b)
 Un evento NUNCA debe contarse en dos categorías a la vez.
 
 AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
@@ -129,9 +175,9 @@ FORMATO DE SALIDA (obligatorio, en español):
    alcanzó el umbral.
 4. TABLA DE TRANSPARENCIA — solo para eventos que SÍ llegaron a calcularse
    (categorías 4, 5 y 6 — EV insuficiente, divergencia excesiva, o confianza
-   <8/10). Para las categorías 1, 2 y 3 (frescura, pendiente_desarrollo,
-   liquidez insuficiente) NO se arma tabla evento por evento — repórtalas
-   solo como conteo agregado en el resumen (punto 1), porque en esas
+   <8/10). Para las categorías 1, 2 y 3 (frescura, pendiente_desarrollo/fuente
+   inaccesible, liquidez insuficiente) NO se arma tabla evento por evento —
+   repórtalas solo como conteo agregado en el resumen (punto 1), porque en esas
    categorías nunca se llegó a calcular EV ni divergencia y desglosarlas no
    aporta información nueva.
 
@@ -144,6 +190,16 @@ FORMATO DE SALIDA (obligatorio, en español):
    - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
      "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
      6/10 — fuente externa reciente pero noticia de lesión no cuantificable").
+5. CASI CALIFICÓ (nuevo en v3.4): de los eventos en categorías 4, 5 y 6 que SÍ
+   tuvieron datos reales calculados (no los marcados "N/A — no se pudo
+   verificar"), identifica los 1-3 que estuvieron más cerca de pasar TODOS los
+   umbrales — por ejemplo, divergencia apenas sobre el 9%, EV apenas debajo del
+   4%, o confianza a 1-2 puntos de 8/10. Preséntalos en una tabla corta,
+   ordenada de más cerca a menos cerca del umbral:
+   | Partido | Qué faltó | Qué tan cerca (número exacto vs. umbral) |
+   Si ningún evento tiene datos reales suficientes para esta comparación,
+   omite la tabla y dilo explícitamente: "No hay eventos con datos suficientes
+   para evaluar cercanía al umbral en esta corrida."
 """
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -162,8 +218,20 @@ ANTHROPIC_VERSION = "2023-06-01"
 #     Los deportes marcados abajo como "usa_elo_interno": True son candidatos a
 #     que el motor Elo interno los resuelva automáticamente cuando acumule
 #     suficiente historial (ver sección 1c).
+#
+#     NUEVO v3.4 — "fuente_respaldo": fuente de respaldo DOCUMENTADA que la IA
+#     puede citar (explícitamente como respaldo, nunca como si fuera la
+#     primaria) SOLO si tanto `fuente_primaria` como `fuente_secundaria` (si
+#     existe) no exponen un número público tras un intento real de búsqueda.
+#     Se agregó para los deportes donde ESPN publica un "Matchup Predictor"
+#     públicamente accesible como alternativa razonable a fuentes que a veces
+#     están detrás de muro de pago o no exponen la probabilidad en texto
+#     buscable (ej. FanGraphs). No se agrega a deportes donde no hay un
+#     respaldo público conocido y confiable (tenis, cricket, boxeo, MMA,
+#     fútbol) — para esos, sin respaldo documentado, el evento va a categoría 2
+#     si la fuente primaria/secundaria no es accesible.
 # ==============================================================================
-REGISTRY_ULTIMA_REVISION = "2026-08-20"
+REGISTRY_ULTIMA_REVISION = "2026-08-21"
 
 MODEL_REGISTRY = [
     {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
@@ -174,18 +242,23 @@ MODEL_REGISTRY = [
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
      "usa_elo_interno": False},
     {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
     {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
     {"patron": "basketball_nba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "basketball_wnba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "basketball_ncaab", "fuente_primaria": "Basketball-Reference (NCAA)", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "icehockey_nhl", "fuente_primaria": "Hockey-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "cricket", "fuente_primaria": "ICC Team Ratings", "fuente_secundaria": "ESPN Cricinfo",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
@@ -707,7 +780,7 @@ def listar_modelos_claude(anthropic_api_key):
         return []
 
 
-def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096):
+def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000):
     """
     Llama a la API de Claude con el tool de web_search FORZADO en el propio
     request — no depende de ningún toggle manual de interfaz.
@@ -718,10 +791,11 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096)
       (requests/tokens por minuto), NO el saldo en dólares de la cuenta. El
       saldo prepagado solo se ve en console.anthropic.com → Billing.
 
-    NOTA v3.3: con la tabla de transparencia (sección 4 del prompt) activada,
-    esta llamada puede necesitar más tokens de salida que antes — si notas
-    respuestas cortadas, sube `max_tokens` (ej. 6000-8000) al llamar esta
-    función desde la interfaz.
+    NOTA v3.3/v3.4: con la tabla de transparencia y la sección "casi calificó"
+    activadas, esta llamada puede necesitar bastantes tokens de salida —
+    default subido a 8000. Si notas respuestas cortadas en corridas con
+    "TODOS LOS DEPORTES ACTIVOS" (muchos eventos externa_directa), considera
+    correr por deporte individual en vez de todos a la vez.
     """
     url = f"{ANTHROPIC_API_BASE}/messages"
     headers = {
@@ -763,7 +837,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.3 (Multi-IA, Multi-Deporte & Motor Elo Interno)")
+st.title("📊 Analista de Apuesta Única v3.4 (Multi-IA, Multi-Deporte & Motor Elo Interno)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
