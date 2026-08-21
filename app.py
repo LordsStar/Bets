@@ -721,6 +721,132 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
 
 
 # ==============================================================================
+# 2b. MODO "POR DEPORTE" (nuevo en v3.5)
+#
+#     PROBLEMA QUE RESUELVE: con "TODOS LOS DEPORTES ACTIVOS" en un solo
+#     prompt, el presupuesto de búsqueda de la IA se reparte entre 30-40+
+#     eventos. En la práctica, esto significa que varios eventos con valor
+#     real (EV/divergencia buenos) terminan sin verificar simplemente porque
+#     la IA se quedó sin tiempo/tokens antes de llegar a ellos — no porque
+#     hayan fallado ningún umbral. Este modo divide el trabajo en varios
+#     prompts más pequeños, uno por familia de deporte, para que cada evento
+#     reciba una búsqueda real.
+#
+#     BONUS DE EFICIENCIA: los eventos con cobertura "pendiente_desarrollo" o
+#     "excluido_estructural" NUNCA necesitan que la IA busque nada — el
+#     resultado ya es 100% determinístico. Este modo los separa y genera su
+#     resumen directamente en código, con CERO tokens de IA gastados en ellos.
+# ==============================================================================
+
+def familia_deporte(sport_key):
+    """Agrupa eventos en familias amplias usando el prefijo del sport_key de
+    The Odds API (ej. 'soccer_belgium_first_div' -> 'soccer',
+    'baseball_mlb' -> 'baseball'). Sirve para dividir un prompt gigante en
+    varios prompts manejables, uno por familia."""
+    if not sport_key:
+        return "otros"
+    return sport_key.split("_")[0]
+
+
+def agrupar_eventos_por_familia(eventos):
+    grupos = {}
+    for ev in eventos:
+        familia = familia_deporte(ev.get("sport_key"))
+        grupos.setdefault(familia, []).append(ev)
+    return grupos
+
+
+def separar_ia_vs_automatico(eventos_familia):
+    """Divide los eventos de una familia entre los que SÍ necesitan que la IA
+    busque y analice ('externa_directa', 'modelo_interno_elo') y los que ya
+    son descarte 100% determinístico por reglas del backend
+    ('pendiente_desarrollo', 'excluido_estructural'). Estos últimos NUNCA
+    necesitan gastar tokens de IA — el resultado ya se sabe de antemano."""
+    necesita_ia, automaticos = [], []
+    for ev in eventos_familia:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        if cobertura in ("pendiente_desarrollo", "excluido_estructural"):
+            automaticos.append(ev)
+        else:
+            necesita_ia.append(ev)
+    return necesita_ia, automaticos
+
+
+def resumen_automatico_grupo(familia, eventos_automaticos):
+    """Genera, SIN usar IA, el resumen de descarte para eventos ya
+    determinísticos (categoría 2) — ahorra el 100% de los tokens de esos
+    eventos porque el resultado no depende de ninguna búsqueda."""
+    if not eventos_automaticos:
+        return None
+    lineas = [
+        f"**{familia.upper()}** — {len(eventos_automaticos)} evento(s), "
+        f"0 tokens de IA usados (descarte automático, categoría 2):"
+    ]
+    for ev in eventos_automaticos:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        lineas.append(f"- {ev.get('partido')} ({ev.get('deporte')}) — {cobertura}")
+    return "\n".join(lineas)
+
+
+def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
+    """Arma un prompt scoped a UNA familia de deporte, reutilizando el mismo
+    SYSTEM_PROMPT_BLINDADO_V3_2 (reglas idénticas), pero con el JSON limitado
+    a los eventos de esa familia que sí necesitan verificación de IA."""
+    return (
+        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+        f"==================================================\n"
+        f"CONTEXTO DE EJECUCIÓN DEL BACKEND (MODO POR DEPORTE)\n"
+        f"==================================================\n"
+        f"ÁMBITO GENERAL DE LA CORRIDA: {seleccion_label}\n"
+        f"GRUPO ANALIZADO EN ESTE PROMPT: {familia.upper()} "
+        f"({len(eventos_grupo)} evento(s))\n"
+        f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
+        f"{seccion_movimiento}\n\n"
+        f"NOTA IMPORTANTE: Este prompt contiene ÚNICAMENTE los eventos de la "
+        f"familia '{familia}' que ya pasaron el pre-filtrado de frescura y "
+        f"liquidez y tienen cobertura 'externa_directa' o 'modelo_interno_elo'. "
+        f"Los eventos de esta misma familia con cobertura 'pendiente_desarrollo' "
+        f"o 'excluido_estructural' YA fueron descartados por el backend sin "
+        f"usar IA (ver resumen aparte) — no vienen en este JSON, y por lo "
+        f"tanto NO deben aparecer en tu conteo de categoría 2 de este prompt "
+        f"(ese conteo se reporta aparte, fuera de la IA).\n\n"
+        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
+        f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
+        f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
+        f"de-vig ni filtres por rango nuevamente.\n\n"
+        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS (solo familia '{familia}'):\n"
+        f"{json.dumps(eventos_grupo, indent=2, ensure_ascii=False)}"
+    )
+
+
+def construir_prompts_por_deporte(eventos_filtrados, seleccion_label, hora_rd, seccion_movimiento):
+    """Devuelve (prompts_por_grupo: dict[str, str], resumen_automatico: str).
+    prompts_por_grupo solo incluye familias con al menos 1 evento que
+    necesita IA — las familias 100% automáticas no generan prompt."""
+    grupos = agrupar_eventos_por_familia(eventos_filtrados)
+    prompts_por_grupo = {}
+    resúmenes_automaticos = []
+
+    for familia, eventos_familia in sorted(grupos.items()):
+        necesita_ia, automaticos = separar_ia_vs_automatico(eventos_familia)
+        if automaticos:
+            resumen = resumen_automatico_grupo(familia, automaticos)
+            if resumen:
+                resúmenes_automaticos.append(resumen)
+        if necesita_ia:
+            prompts_por_grupo[familia] = construir_prompt_grupo(
+                familia, necesita_ia, seleccion_label, hora_rd, seccion_movimiento
+            )
+
+    resumen_automatico_total = (
+        "\n\n".join(resúmenes_automaticos)
+        if resúmenes_automaticos
+        else "Ningún evento cayó en descarte 100% automático en esta corrida."
+    )
+    return prompts_por_grupo, resumen_automatico_total
+
+
+# ==============================================================================
 # 3. GEMINI — modelos SIEMPRE consultados en vivo (nunca hardcodeados).
 # ==============================================================================
 
@@ -837,7 +963,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.4 (Multi-IA, Multi-Deporte & Motor Elo Interno)")
+st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno & Modo por Deporte)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
@@ -900,6 +1026,18 @@ if api_key:
         seleccion = st.selectbox("Selecciona el deporte o ámbito a analizar:", list(opciones_deporte.keys()))
         deporte_key_seleccionado = opciones_deporte[seleccion]
 
+        modo_ejecucion = st.radio(
+            "Modo de análisis:",
+            ["Todo en un solo prompt (rápido, menos preciso)", "Separado por deporte (más lento, cobertura completa)"],
+            help=(
+                "'Todo en un prompt' es más barato pero, con muchos eventos, la IA puede quedarse sin "
+                "presupuesto de búsqueda antes de verificar todos — algunos con valor real pueden quedar "
+                "sin analizar. 'Separado por deporte' cuesta más tokens en total pero garantiza que cada "
+                "evento reciba una búsqueda real, y no gasta tokens de IA en eventos ya descartables "
+                "automáticamente (CFL, AFL, NRL, KBO, NPB sin historial, etc.)."
+            ),
+        )
+
         if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
             with st.spinner("Consultando The Odds API, actualizando motor Elo y procesando pre-filtros..."):
                 datos_acumulados = []
@@ -943,7 +1081,9 @@ if api_key:
 
                 if not eventos_filtrados:
                     st.warning("⚠️ No se encontraron candidatos válidos en el rango 1.40 - 2.00 para los partidos de hoy.")
-                else:
+                elif modo_ejecucion.startswith("Todo en un solo prompt"):
+                    st.session_state.pop("prompts_por_grupo", None)
+                    st.session_state.pop("resumen_automatico_grupo", None)
                     prompt_completo = (
                         f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
                         f"==================================================\n"
@@ -962,6 +1102,25 @@ if api_key:
                     )
                     st.session_state["prompt_generado"] = prompt_completo
                     st.success(f"✅ Se consolidaron {len(eventos_filtrados)} eventos aptos para el prompt.")
+                else:
+                    st.session_state.pop("prompt_generado", None)
+                    prompts_por_grupo, resumen_auto = construir_prompts_por_deporte(
+                        eventos_filtrados, seleccion, hora_rd, seccion_movimiento
+                    )
+                    st.session_state["prompts_por_grupo"] = prompts_por_grupo
+                    st.session_state["resumen_automatico_grupo"] = resumen_auto
+                    n_grupos = len(prompts_por_grupo)
+                    n_eventos_ia = sum(
+                        p.count('"partido"') for p in prompts_por_grupo.values()
+                    )
+                    st.success(
+                        f"✅ Se armaron {n_grupos} prompt(s) por familia de deporte "
+                        f"({n_eventos_ia} eventos requieren IA). Los descartes 100% "
+                        f"automáticos se resolvieron sin gastar tokens de IA — revísalos abajo."
+                    )
+                    if resumen_auto:
+                        with st.expander("📋 Descartes automáticos (0 tokens de IA)"):
+                            st.markdown(resumen_auto)
 
     if "prompt_generado" in st.session_state:
         st.divider()
@@ -1075,5 +1234,69 @@ if api_key:
                             st.caption(f"Esta llamada: {entrada_tok:,} tokens de entrada · {salida_tok:,} de salida.")
                         except Exception as e:
                             st.error(f"Error al ejecutar con Claude API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
+
+    # ==========================================================================
+    # MODO "POR DEPORTE" — un prompt (y opcionalmente una llamada a Claude)
+    # por cada familia de deporte que sí necesita verificación de IA.
+    # ==========================================================================
+    if "prompts_por_grupo" in st.session_state and st.session_state["prompts_por_grupo"]:
+        st.divider()
+        st.subheader("🧩 Modo por deporte — prompts individuales")
+        prompts_por_grupo = st.session_state["prompts_por_grupo"]
+
+        for familia, prompt_texto in prompts_por_grupo.items():
+            with st.expander(f"📋 Prompt — {familia.upper()}"):
+                st.code(prompt_texto, language="markdown")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecutar TODOS los grupos con Claude API")
+            st.caption(
+                "Corre una llamada por cada familia de deporte (cada una con su propia "
+                "búsqueda web forzada) y acumula el resultado y el uso de tokens de todas."
+            )
+            modelos_claude_grp = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude_grp:
+                modelo_default_grp = next(
+                    (m for m in modelos_claude_grp if "sonnet" in m.lower()), modelos_claude_grp[0]
+                )
+                modelo_grp_elegido = st.selectbox(
+                    "Modelo Claude para el modo por deporte:",
+                    modelos_claude_grp,
+                    index=modelos_claude_grp.index(modelo_default_grp),
+                    key="modelo_por_deporte",
+                )
+                if st.button("🤖 Analizar TODOS los grupos", type="primary", key="btn_todos_grupos"):
+                    total_entrada, total_salida = 0, 0
+                    for familia, prompt_texto in prompts_por_grupo.items():
+                        with st.spinner(f"Analizando {familia.upper()} (con búsqueda web activa)..."):
+                            try:
+                                resultado, queries, uso_tokens, _ = llamar_claude_rest(
+                                    anthropic_api_key, modelo_grp_elegido, prompt_texto, max_tokens=8000,
+                                )
+                                st.markdown(f"### 🏆 Resultado — {familia.upper()}")
+                                st.markdown(resultado)
+                                if queries:
+                                    with st.expander(f"🔍 Búsquedas realizadas en {familia.upper()} ({len(queries)})"):
+                                        for q in queries:
+                                            st.write(f"- {q}")
+                                entrada_tok = uso_tokens.get("input_tokens", 0) or 0
+                                salida_tok = uso_tokens.get("output_tokens", 0) or 0
+                                total_entrada += entrada_tok
+                                total_salida += salida_tok
+                                st.caption(
+                                    f"{familia.upper()}: {entrada_tok:,} tokens de entrada · "
+                                    f"{salida_tok:,} de salida."
+                                )
+                            except Exception as e:
+                                st.error(f"Error al analizar {familia.upper()}: {e}")
+                    st.divider()
+                    st.success(
+                        f"✅ Corrida por deporte completa — TOTAL: {total_entrada:,} tokens de "
+                        f"entrada · {total_salida:,} de salida · {total_entrada + total_salida:,} tokens "
+                        f"en total (sobre {len(prompts_por_grupo)} grupo(s))."
+                    )
             else:
                 st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
