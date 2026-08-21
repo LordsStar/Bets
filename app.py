@@ -7,10 +7,11 @@ import requests
 import streamlit as st
 
 # ==============================================================================
-# 1. SYSTEM PROMPT V3.2 — BLINDADO
+# 1. SYSTEM PROMPT V3.3 — BLINDADO
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
 #    relativo, Model Registry obligatorio, motor Elo interno calibrado como
-#    segundo modelo válido, reglas anti-fabricación y formato de salida fijo.
+#    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
+#    y ahora también tabla de transparencia con los descartes (EV/divergencia).
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_2 = """
 PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.3)
@@ -94,6 +95,10 @@ REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
   evento se descarta — nunca se rellena el vacío con una suposición "razonable".
 - Cada afirmación estadística debe llevar su fuente (nombre + URL, o "Modelo Elo
   interno" con sus métricas si aplica).
+- Si un evento se descartó en la categoría 1, 2 o 3 (frescura, pendiente_desarrollo
+  o liquidez), NUNCA calcules ni inventes un EV% o divergencia% para él — en esos
+  casos ni siquiera se llegó a evaluar el segundo modelo. Repórtalo como "N/A — no
+  se calculó" en la tabla de la sección de salida 4.
 
 CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (nuevo en v3.3):
 Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
@@ -122,6 +127,23 @@ FORMATO DE SALIDA (obligatorio, en español):
 3. Si NO hay pick: decirlo explícitamente en la primera línea ("PICK DEL DÍA:
    NINGUNO") y explicar brevemente, por categoría, por qué ningún evento
    alcanzó el umbral.
+4. TABLA DE TRANSPARENCIA — solo para eventos que SÍ llegaron a calcularse
+   (categorías 4, 5 y 6 — EV insuficiente, divergencia excesiva, o confianza
+   <8/10). Para las categorías 1, 2 y 3 (frescura, pendiente_desarrollo,
+   liquidez insuficiente) NO se arma tabla evento por evento — repórtalas
+   solo como conteo agregado en el resumen (punto 1), porque en esas
+   categorías nunca se llegó a calcular EV ni divergencia y desglosarlas no
+   aporta información nueva.
+
+   Formato de la tabla (una fila por evento de las categorías 4/5/6):
+   | Partido | Categoría | EV% | Divergencia% | Confianza | Motivo breve (1 línea) |
+
+   - EV% y Divergencia%: el número real calculado, con 1-2 decimales.
+   - Confianza: solo aplica si el evento llegó a la categoría 6 (si fue
+     descartado en 4 o 5, escribe "N/A — descartado antes de este cálculo").
+   - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
+     "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
+     6/10 — fuente externa reciente pero noticia de lesión no cuantificable").
 """
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -695,6 +717,11 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=4096)
     - ratelimit: headers 'anthropic-ratelimit-*' — son ventanas de tasa
       (requests/tokens por minuto), NO el saldo en dólares de la cuenta. El
       saldo prepagado solo se ve en console.anthropic.com → Billing.
+
+    NOTA v3.3: con la tabla de transparencia (sección 4 del prompt) activada,
+    esta llamada puede necesitar más tokens de salida que antes — si notas
+    respuestas cortadas, sube `max_tokens` (ej. 6000-8000) al llamar esta
+    función desde la interfaz.
     """
     url = f"{ANTHROPIC_API_BASE}/messages"
     headers = {
@@ -945,7 +972,8 @@ if api_key:
                     with st.spinner(f"Analizando con {modelo_claude_elegido} (con búsqueda web activa)..."):
                         try:
                             resultado, queries_buscadas, uso_tokens, ratelimit = llamar_claude_rest(
-                                anthropic_api_key, modelo_claude_elegido, st.session_state["prompt_generado"]
+                                anthropic_api_key, modelo_claude_elegido, st.session_state["prompt_generado"],
+                                max_tokens=8000,
                             )
                             st.markdown("### 🏆 Resultado del Análisis")
                             st.markdown(resultado)
