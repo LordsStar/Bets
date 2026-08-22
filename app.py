@@ -1,5 +1,7 @@
 """
-Analista de Apuesta Única — v3.7 (fix Brier sidebar)
+Analista de Apuesta Única — v3.8
+Fixes: más bookmakers/regiones, consenso proxy (min 1 casa),
+ClubElo HTTPS+fecha+fuzzy, aliases MLS/LatAm, Brier sidebar.
 Requisitos: streamlit, pandas, beautifulsoup4, requests
 """
 
@@ -25,12 +27,20 @@ CUOTA_MIN = 1.40
 CUOTA_MAX = 2.00
 VENTANA_HORAS_DEFAULT = 24
 
-CONSENSO_MIN_CASAS = 2
+CONSENSO_MIN_CASAS = 1
 CONSENSO_DIVERGENCIA_CERCANIA = 0.06
 CONSENSO_EV_CERCANIA = 0.02
 CONFIANZA_TOPE_CONSENSO = 7
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_REGIONS = "us,uk,eu,au"
+ODDS_BOOKMAKERS = (
+    "pinnacle,bet365,draftkings,fanduel,williamhill,"
+    "betfair_ex_uk,unibet_eu,betonlineag,lowvig,bovada,"
+    "pointsbetau,tab,neds,sportsbet,ladbrokes_au,"
+    "coral,paddypower,skybet,betway,betrivers,caesars"
+)
+
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -42,16 +52,13 @@ GEMINI_TOKEN_WARNING = 500_000
 CLAUDE_WEB_SEARCH_MAX_USES = 8
 
 ENABLE_FOREBET = False
-CLUBELO_API_BASE = "http://api.clubelo.com"
+CLUBELO_API_BASES = ("https://api.clubelo.com", "http://api.clubelo.com")
 FOREBET_URL = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
 SPORTS_WHITELIST_PREFIXES = []
 REGISTRY_ULTIMA_REVISION = "2026-08-22"
 
-# ==============================================================================
-# SYSTEM PROMPT V3.7
-# ==============================================================================
-SYSTEM_PROMPT_BLINDADO_V3_7 = f"""
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.7)
+SYSTEM_PROMPT_BLINDADO_V3_8 = f"""
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.8)
 
 ROL: Selecciona UNA apuesta (cuota {CUOTA_MIN:.2f}-{CUOTA_MAX:.2f}) o 0 picks si nada califica.
 Nunca fuerces un pick.
@@ -92,7 +99,7 @@ MODEL_REGISTRY = [
      "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
     {"patron": "soccer", "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures)", "fuente_secundaria": None,
      "fuente_respaldo": "Forebet (sin metodología pública verificable)",
-     "cobertura": "externa_directa", "version": "2.1", "usa_elo_interno": False},
+     "cobertura": "externa_directa", "version": "2.2", "usa_elo_interno": False},
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs (usar SIEMPRE ?date=YYYY-MM-DD)", "fuente_secundaria": None,
@@ -275,8 +282,9 @@ CLUBELO_NAME_ALIASES = {
     "inter": "Inter", "inter milan": "Inter", "internazionale": "Inter",
     "ac milan": "Milan", "milan": "Milan", "juventus": "Juventus",
     "ssc napoli": "Napoli", "napoli": "Napoli", "as roma": "Roma", "roma": "Roma",
-    "lazio": "Lazio", "atalanta": "Atalanta", "fiorentina": "Fiorentina", "torino": "Torino",
-    "bologna": "Bologna", "genoa": "Genoa", "udinese": "Udinese", "sassuolo": "Sassuolo",
+    "lazio": "Lazio", "atalanta": "Atalanta", "atalanta bc": "Atalanta",
+    "fiorentina": "Fiorentina", "torino": "Torino", "bologna": "Bologna",
+    "genoa": "Genoa", "udinese": "Udinese", "sassuolo": "Sassuolo",
     "cagliari": "Cagliari", "empoli": "Empoli", "monza": "Monza", "lecce": "Lecce",
     "verona": "Verona", "hellas verona": "Verona", "parma": "Parma", "como": "Como", "venezia": "Venezia",
     "bayern munich": "Bayern", "bayern münchen": "Bayern", "fc bayern munich": "Bayern",
@@ -300,11 +308,50 @@ CLUBELO_NAME_ALIASES = {
     "ajax": "Ajax", "psv": "PSV", "psv eindhoven": "PSV", "feyenoord": "Feyenoord",
     "benfica": "Benfica", "sl benfica": "Benfica", "porto": "Porto", "fc porto": "Porto",
     "sporting cp": "Sporting", "sporting lisbon": "Sporting", "celtic": "Celtic", "rangers": "Rangers",
-    "galatasaray": "Galatasaray", "fenerbahce": "Fenerbahce", "besiktas": "Besiktas",
+    "galatasaray": "Galatasaray", "fenerbahce": "Fenerbahce", "besiktas": "Besiktas", "besiktas jk": "Besiktas",
     "olympiacos": "Olympiakos", "olympiakos": "Olympiakos",
     "shakhtar donetsk": "Shakhtar", "dynamo kyiv": "Dynamo Kyiv",
     "red bull salzburg": "Salzburg", "fc salzburg": "Salzburg",
     "young boys": "Young Boys", "club brugge": "Club Brugge", "anderlecht": "Anderlecht",
+    # MLS / LatAm / extra v3.8
+    "inter miami": "Inter Miami", "atlanta united": "Atlanta", "la galaxy": "LA Galaxy",
+    "los angeles fc": "Los Angeles FC", "lafc": "Los Angeles FC",
+    "seattle sounders": "Seattle", "seattle sounders fc": "Seattle",
+    "portland timbers": "Portland", "vancouver whitecaps": "Vancouver",
+    "vancouver whitecaps fc": "Vancouver", "fc dallas": "Dallas",
+    "columbus crew": "Columbus", "columbus crew sc": "Columbus",
+    "nashville sc": "Nashville", "charlotte fc": "Charlotte",
+    "dc united": "DC United", "d.c. united": "DC United",
+    "fc cincinnati": "Cincinnati", "new york city fc": "NYCFC",
+    "new york red bulls": "NY Red Bulls", "orlando city": "Orlando",
+    "philadelphia union": "Philadelphia", "chicago fire": "Chicago Fire",
+    "sporting kansas city": "Sporting KC", "real salt lake": "Salt Lake",
+    "minnesota united": "Minnesota", "houston dynamo": "Houston",
+    "san jose earthquakes": "San Jose", "colorado rapids": "Colorado",
+    "cf montreal": "Montreal", "toronto fc": "Toronto",
+    "guadalajara": "Guadalajara", "chivas": "Guadalajara",
+    "cruz azul": "Cruz Azul", "tijuana": "Tijuana", "atlas": "Atlas",
+    "fluminense": "Fluminense", "remo": "Remo", "ceara": "Ceara", "ceará": "Ceara",
+    "londrina": "Londrina", "gimnasia la plata": "Gimnasia LP",
+    "gimnasia mendoza": "Gimnasia Mza", "universidad catolica": "U Catolica",
+    "universidad católica (chi)": "U Catolica", "ñublense": "Nublense",
+    "nublense": "Nublense", "la serena": "La Serena", "cobresal": "Cobresal",
+    "paok thessaloniki": "PAOK", "levadiakos": "Levadiakos",
+    "frosinone": "Frosinone", "heerenveen": "Heerenveen", "fc zwolle": "Zwolle",
+    "go ahead eagles": "Go Ahead Eagles", "ado den haag": "Den Haag",
+    "gks katowice": "Katowice", "wisla plock": "Wisla Plock", "wisła płock": "Wisla Plock",
+    "vitoria sc": "Vitoria", "vitória sc": "Vitoria", "nacional": "Nacional",
+    "fc dynamo makhachkala": "Makhachkala", "fc krasnodar": "Krasnodar",
+    "cd castellon": "Castellon", "cd castellón": "Castellon", "sabadell fc": "Sabadell",
+    "hammarby if": "Hammarby", "gais": "GAIS", "ik oddevold": "Oddevold",
+    "helsingborgs if": "Helsingborg", "alanyaspor": "Alanyaspor",
+    "goztepe": "Goztepe", "genclerbirligi sk": "Genclerbirligi",
+    "fc machida zelvia": "Machida", "urawa red diamonds": "Urawa",
+    "gwangju fc": "Gwangju", "incheon united": "Incheon",
+    "hjk helsinki": "HJK", "if gnistan": "Gnistan", "tps turku": "TPS",
+    "fc inter turku": "Inter Turku", "sonderjyske": "SonderjyskE",
+    "fc nordsjaelland": "Nordsjaelland", "agf aarhus": "AGF",
+    "ob odense bk": "Odense", "fc midtjylland": "Midtjylland", "randers fc": "Randers",
 }
 
 def _strip_accents(s):
@@ -314,6 +361,7 @@ def _normalizar_nombre(nombre):
     if not nombre:
         return ""
     s = _strip_accents(nombre).lower().strip()
+    s = re.sub(r"\([^)]*\)", " ", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     for tok in (" fc", " cf", " afc", " sc", " ac", " as", " fk", " nk", " bk", " if"):
@@ -352,6 +400,30 @@ def resolver_nombre_clubelo(nombre_odds, nombres_clubelo_disponibles=None):
             return best, f"fuzzy_{best_score:.2f}"
     return None, "sin_match"
 
+def _fuzzy_clubelo_libre(nombre, nombres_disp, umbral=0.45):
+    if not nombre or not nombres_disp:
+        return None, "vacio"
+    limpio = _normalizar_nombre(nombre)
+    tok_q = {t for t in limpio.split() if len(t) > 2}
+    if not tok_q:
+        return None, "sin_tokens"
+    best, best_score = None, 0.0
+    for original in nombres_disp:
+        tok_n = {t for t in _normalizar_nombre(original).split() if len(t) > 2}
+        if not tok_n:
+            continue
+        inter = len(tok_q & tok_n)
+        union = len(tok_q | tok_n)
+        score = inter / union if union else 0.0
+        longest = max(tok_q, key=len)
+        if longest in _normalizar_nombre(original):
+            score += 0.15
+        if score > best_score:
+            best_score, best = score, original
+    if best is not None and best_score >= umbral:
+        return best, f"fuzzy_libre_{best_score:.2f}"
+    return None, "sin_match"
+
 def _log_clubelo_failure(home, away, reason):
     fails = st.session_state.setdefault("clubelo_match_failures", [])
     entry = f"{home} vs {away} — {reason}"
@@ -359,18 +431,31 @@ def _log_clubelo_failure(home, away, reason):
         fails.append(entry)
         st.session_state["clubelo_match_failures"] = fails[-50:]
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def obtener_fixtures_clubelo():
-    try:
-        r = requests.get(f"{CLUBELO_API_BASE}/Fixtures", timeout=12)
-        r.raise_for_status()
-        texto = r.text.strip()
-        if not texto or texto.lower().startswith("site overloaded"):
-            return None
-        df = pd.read_csv(StringIO(r.text))
-        return df if not df.empty else None
-    except Exception:
-        return None
+@st.cache_data(ttl=1800, show_spinner=False)
+def obtener_fixtures_clubelo(fecha_yyyy_mm_dd=None):
+    paths = []
+    if fecha_yyyy_mm_dd:
+        paths.append(f"/Fixtures/{fecha_yyyy_mm_dd}")
+    paths.append("/Fixtures")
+    for base in CLUBELO_API_BASES:
+        for path in paths:
+            try:
+                r = requests.get(
+                    base + path,
+                    timeout=15,
+                    headers={"User-Agent": "BlindadoBot/3.8", "Accept": "text/csv"},
+                )
+                if r.status_code != 200:
+                    continue
+                texto = (r.text or "").strip()
+                if not texto or texto.lower().startswith("site overloaded"):
+                    continue
+                df = pd.read_csv(StringIO(r.text))
+                if df is not None and not df.empty and "Home" in df.columns:
+                    return df
+            except Exception:
+                continue
+    return None
 
 def _es_columna_gd(nombre_columna):
     try:
@@ -389,19 +474,22 @@ def _prob_desde_fixtures_clubelo(df, home_team, away_team):
     home_r, mh = resolver_nombre_clubelo(home_team, todos)
     away_r, ma = resolver_nombre_clubelo(away_team, todos)
     if not home_r or not away_r:
-        _log_clubelo_failure(home_team, away_team, f"match fallido ({mh}/{ma})")
-        return None
+        home_r2, mh2 = _fuzzy_clubelo_libre(home_team, todos)
+        away_r2, ma2 = _fuzzy_clubelo_libre(away_team, todos)
+        if home_r2 and away_r2:
+            home_r, away_r, mh, ma = home_r2, away_r2, mh2, ma2
+        else:
+            _log_clubelo_failure(home_team, away_team, f"match fallido ({mh}/{ma})")
+            return None
+
+    def _eq(a, b):
+        return str(a).strip().lower() == str(b).strip().lower()
+
     try:
-        match = df[
-            (df["Home"].astype(str).str.strip().str.lower() == home_r.strip().lower())
-            & (df["Away"].astype(str).str.strip().str.lower() == away_r.strip().lower())
-        ]
+        match = df[df["Home"].map(lambda x: _eq(x, home_r)) & df["Away"].map(lambda x: _eq(x, away_r))]
         invertido = False
         if match.empty:
-            match = df[
-                (df["Home"].astype(str).str.strip().str.lower() == away_r.strip().lower())
-                & (df["Away"].astype(str).str.strip().str.lower() == home_r.strip().lower())
-            ]
+            match = df[df["Home"].map(lambda x: _eq(x, away_r)) & df["Away"].map(lambda x: _eq(x, home_r))]
             invertido = not match.empty
         if match.empty:
             _log_clubelo_failure(home_team, away_team, f"no en Fixtures ({home_r}/{away_r})")
@@ -425,7 +513,7 @@ def _prob_desde_fixtures_clubelo(df, home_team, away_team):
         if invertido:
             ph, pa = pa, ph
         total = ph + pd_ + pa
-        if total <= 0 or abs(total - 1.0) > 0.02:
+        if total <= 0 or abs(total - 1.0) > 0.05:
             _log_clubelo_failure(home_team, away_team, f"suma probs={total:.4f}")
             return None
         return {
@@ -448,7 +536,7 @@ def obtener_prediccion_forebet(home_team, away_team):
     except ImportError:
         return None
     try:
-        r = requests.get(FOREBET_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.7)"})
+        r = requests.get(FOREBET_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.8)"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         filas = soup.select("div.rcnt") or soup.select(".rcnt")
@@ -485,17 +573,26 @@ def obtener_prediccion_forebet(home_team, away_team):
         return None
     return None
 
-def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
+def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_utc=None):
     if not sport_key or not sport_key.startswith("soccer") or not home_team or not away_team:
         return None
-    res = _prob_desde_fixtures_clubelo(obtener_fixtures_clubelo(), home_team, away_team)
+    fecha = None
+    if commence_utc:
+        try:
+            fecha = datetime.fromisoformat(commence_utc.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        except Exception:
+            fecha = None
+    df = obtener_fixtures_clubelo(fecha)
+    if df is None and fecha:
+        df = obtener_fixtures_clubelo(None)
+    res = _prob_desde_fixtures_clubelo(df, home_team, away_team)
     if res:
         return {
             "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures) — resuelto directo por backend",
             "fuente_secundaria": None,
             "fuente_respaldo": "Forebet (sin metodología pública verificable)",
             "cobertura": "modelo_externo_backend",
-            "version": "1.1",
+            "version": "1.2",
             "ultima_revision": REGISTRY_ULTIMA_REVISION,
             "probabilidad_home": res["prob_home"],
             "probabilidad_draw": res["prob_draw"],
@@ -509,9 +606,9 @@ def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
             return {
                 "fuente_primaria": "ClubElo — sin dato",
                 "fuente_secundaria": None,
-                "fuente_respaldo": "Forebet (respaldo, sin metodología pública) — backend",
+                "fuente_respaldo": "Forebet (respaldo) — backend",
                 "cobertura": "modelo_externo_backend",
-                "version": "1.1",
+                "version": "1.2",
                 "ultima_revision": REGISTRY_ULTIMA_REVISION,
                 "probabilidad_home": fb["prob_home"],
                 "probabilidad_draw": fb["prob_draw"],
@@ -520,10 +617,10 @@ def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
             }
     return None
 
-def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
+def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None, commence_utc=None):
     base = _buscar_base_registry(sport_key)
     if sport_key and sport_key.startswith("soccer") and home_team and away_team:
-        r = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team)
+        r = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_utc=commence_utc)
         if r:
             return r
     if (
@@ -570,11 +667,13 @@ def obtener_cuotas_api(api_key, sport_key):
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
     params = {
         "apiKey": api_key,
+        "regions": ODDS_REGIONS,
         "markets": "h2h",
-        "bookmakers": "pinnacle,stake,betonlineag,bet365",
+        "oddsFormat": "decimal",
+        "bookmakers": ODDS_BOOKMAKERS,
     }
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         restantes = response.headers.get("x-requests-remaining")
         usados = response.headers.get("x-requests-used")
         if restantes is not None:
@@ -582,9 +681,13 @@ def obtener_cuotas_api(api_key, sport_key):
         if response.status_code == 401:
             st.error(f"❌ API Key inválida al consultar {sport_key}.")
             return []
-        if response.status_code in (422, 429):
-            if response.status_code == 429:
-                st.warning(f"⚠️ Rate limit en {sport_key}, se omite.")
+        if response.status_code == 422:
+            params.pop("bookmakers", None)
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code != 200:
+                return []
+        if response.status_code == 429:
+            st.warning(f"⚠️ Rate limit en {sport_key}, se omite.")
             return []
         response.raise_for_status()
         return response.json()
@@ -810,17 +913,19 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
 
         home_team = evento.get("home_team")
         away_team = evento.get("away_team")
+        commence_str = evento.get("commence_time")
+
         registry_entry = obtener_entrada_registry(
             evento.get("sport_key"),
             home_team=home_team,
             away_team=away_team,
             estado_elo=estado_elo,
+            commence_utc=commence_str,
         )
         if registry_entry["cobertura"] == "excluido_estructural":
             c["estructural"] += 1
             continue
 
-        commence_str = evento.get("commence_time")
         if not commence_str:
             c["sin_fecha"] += 1
             continue
@@ -961,7 +1066,7 @@ def resumen_automatico_grupo(familia, eventos_automaticos):
 
 def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
     return (
-        f"{SYSTEM_PROMPT_BLINDADO_V3_7}\n\n"
+        f"{SYSTEM_PROMPT_BLINDADO_V3_8}\n\n"
         f"==================================================\n"
         f"CONTEXTO BACKEND (MODO POR DEPORTE)\n"
         f"==================================================\n"
@@ -1090,8 +1195,8 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
 st.title(
-    "📊 Analista de Apuesta Única v3.7 "
-    "(Consenso proxy · Casi-calificó 5a/5b · ClubElo · Elo · Multi-IA)"
+    "📊 Analista de Apuesta Única v3.8 "
+    "(más casas · ClubElo reforzado · proxy 5b · Multi-IA)"
 )
 
 with st.sidebar:
@@ -1146,7 +1251,6 @@ with st.sidebar:
             for f in st.session_state["clubelo_match_failures"][-15:]:
                 st.caption(f)
 
-    # FIX Brier: no usar {brier:.4f if ...} dentro del f-string
     estado_elo_sidebar = cargar_estado_elo()
     if estado_elo_sidebar.get("ratings"):
         with st.expander("🧠 Motor Elo interno"):
@@ -1167,7 +1271,7 @@ with st.sidebar:
     )
     st.caption(
         f"Proxy 5b: div≤{CONSENSO_DIVERGENCIA_CERCANIA*100:.0f}% "
-        f"o EV≥{CONSENSO_EV_CERCANIA*100:.0f}%"
+        f"o EV≥{CONSENSO_EV_CERCANIA*100:.0f}% · min casas={CONSENSO_MIN_CASAS}"
     )
 
 if api_key:
@@ -1236,6 +1340,7 @@ if api_key:
                                 "Deporte": ev.get("deporte"),
                                 "Cobertura": reg.get("cobertura"),
                                 "Liquidez": ev.get("_liquidez_backend"),
+                                "N casas": ev.get("_n_casas_reportando"),
                                 "EV oficial": (
                                     f"{ofi['mejor_ev']*100:.1f}%"
                                     if ofi.get("mejor_ev") is not None
@@ -1263,7 +1368,7 @@ if api_key:
                     for k in ("prompts_por_grupo", "resumen_automatico_grupo", "eventos_por_grupo"):
                         st.session_state.pop(k, None)
                     prompt = (
-                        f"{SYSTEM_PROMPT_BLINDADO_V3_7}\n\n"
+                        f"{SYSTEM_PROMPT_BLINDADO_V3_8}\n\n"
                         f"==================================================\n"
                         f"CONTEXTO BACKEND\n"
                         f"==================================================\n"
