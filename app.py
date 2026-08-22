@@ -1,7 +1,10 @@
 """
-Analista de Apuesta Única — v3.8
-Fixes: más bookmakers/regiones, consenso proxy (min 1 casa),
-ClubElo HTTPS+fecha+fuzzy, aliases MLS/LatAm, Brier sidebar.
+Analista de Apuesta Única — v3.8.1
+Fixes v3.8.1:
+  - ClubElo: timeout 4s, fail-fast, UNA sola precarga por corrida
+  - Odds API: no escribe session_state dentro de cache
+  - ALL: sleep 0.05 + filtro prioritario opcional
+  - Consenso min=1, más bookmakers, Brier sidebar OK
 Requisitos: streamlit, pandas, beautifulsoup4, requests
 """
 
@@ -40,6 +43,9 @@ ODDS_BOOKMAKERS = (
     "pointsbetau,tab,neds,sportsbet,ladbrokes_au,"
     "coral,paddypower,skybet,betway,betrivers,caesars"
 )
+# En modo ALL, solo estas familias (pon [] para todos los deportes activos)
+ALL_SPORTS_PRIORITY = ("baseball", "soccer", "basketball", "tennis", "icehockey", "americanfootball")
+ALL_SPORTS_SLEEP = 0.05
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
@@ -52,6 +58,7 @@ GEMINI_TOKEN_WARNING = 500_000
 CLAUDE_WEB_SEARCH_MAX_USES = 8
 
 ENABLE_FOREBET = False
+CLUBELO_TIMEOUT = 4
 CLUBELO_API_BASES = ("https://api.clubelo.com", "http://api.clubelo.com")
 FOREBET_URL = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
 SPORTS_WHITELIST_PREFIXES = []
@@ -181,7 +188,7 @@ def calcular_brier(historial_sport):
 def obtener_scores_api(api_key, sport_key, dias=ELO_DIAS_HISTORIAL_SCORES):
     url = f"{ODDS_API_BASE}/sports/{sport_key}/scores/"
     try:
-        r = requests.get(url, params={"apiKey": api_key, "daysFrom": dias}, timeout=10)
+        r = requests.get(url, params={"apiKey": api_key, "daysFrom": dias}, timeout=8)
         if r.status_code in (401, 422, 429):
             return []
         r.raise_for_status()
@@ -257,7 +264,7 @@ def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
     }
 
 # ==============================================================================
-# CLUBELO
+# CLUBELO (rápido)
 # ==============================================================================
 CLUBELO_NAME_ALIASES = {
     "manchester united": "Man United", "manchester city": "Man City",
@@ -313,7 +320,6 @@ CLUBELO_NAME_ALIASES = {
     "shakhtar donetsk": "Shakhtar", "dynamo kyiv": "Dynamo Kyiv",
     "red bull salzburg": "Salzburg", "fc salzburg": "Salzburg",
     "young boys": "Young Boys", "club brugge": "Club Brugge", "anderlecht": "Anderlecht",
-    # MLS / LatAm / extra v3.8
     "inter miami": "Inter Miami", "atlanta united": "Atlanta", "la galaxy": "LA Galaxy",
     "los angeles fc": "Los Angeles FC", "lafc": "Los Angeles FC",
     "seattle sounders": "Seattle", "seattle sounders fc": "Seattle",
@@ -433,6 +439,7 @@ def _log_clubelo_failure(home, away, reason):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def obtener_fixtures_clubelo(fecha_yyyy_mm_dd=None):
+    """Timeout corto. Si ClubElo no responde, None en pocos segundos."""
     paths = []
     if fecha_yyyy_mm_dd:
         paths.append(f"/Fixtures/{fecha_yyyy_mm_dd}")
@@ -442,8 +449,8 @@ def obtener_fixtures_clubelo(fecha_yyyy_mm_dd=None):
             try:
                 r = requests.get(
                     base + path,
-                    timeout=15,
-                    headers={"User-Agent": "BlindadoBot/3.8", "Accept": "text/csv"},
+                    timeout=CLUBELO_TIMEOUT,
+                    headers={"User-Agent": "BlindadoBot/3.8.1", "Accept": "text/csv"},
                 )
                 if r.status_code != 200:
                     continue
@@ -536,7 +543,10 @@ def obtener_prediccion_forebet(home_team, away_team):
     except ImportError:
         return None
     try:
-        r = requests.get(FOREBET_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.8)"})
+        r = requests.get(
+            FOREBET_URL, timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.8.1)"},
+        )
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         filas = soup.select("div.rcnt") or soup.select(".rcnt")
@@ -573,18 +583,20 @@ def obtener_prediccion_forebet(home_team, away_team):
         return None
     return None
 
-def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_utc=None):
+def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_utc=None, df_preloaded=None):
     if not sport_key or not sport_key.startswith("soccer") or not home_team or not away_team:
         return None
-    fecha = None
-    if commence_utc:
-        try:
-            fecha = datetime.fromisoformat(commence_utc.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-        except Exception:
-            fecha = None
-    df = obtener_fixtures_clubelo(fecha)
-    if df is None and fecha:
-        df = obtener_fixtures_clubelo(None)
+    df = df_preloaded
+    if df is None:
+        fecha = None
+        if commence_utc:
+            try:
+                fecha = datetime.fromisoformat(commence_utc.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except Exception:
+                fecha = None
+        df = obtener_fixtures_clubelo(fecha)
+        if df is None and fecha:
+            df = obtener_fixtures_clubelo(None)
     res = _prob_desde_fixtures_clubelo(df, home_team, away_team)
     if res:
         return {
@@ -617,10 +629,15 @@ def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_
             }
     return None
 
-def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None, commence_utc=None):
+def obtener_entrada_registry(
+    sport_key, home_team=None, away_team=None, estado_elo=None, commence_utc=None, df_clubelo=None
+):
     base = _buscar_base_registry(sport_key)
     if sport_key and sport_key.startswith("soccer") and home_team and away_team:
-        r = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team, commence_utc=commence_utc)
+        r = obtener_entrada_clubelo_o_forebet(
+            sport_key, home_team, away_team,
+            commence_utc=commence_utc, df_preloaded=df_clubelo,
+        )
         if r:
             return r
     if (
@@ -664,6 +681,7 @@ def obtener_deportes_activos(api_key):
 
 @st.cache_data(ttl=90, show_spinner=False)
 def obtener_cuotas_api(api_key, sport_key):
+    """Devuelve (eventos, headers_uso). No escribe session_state dentro del cache."""
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
     params = {
         "apiKey": api_key,
@@ -673,26 +691,33 @@ def obtener_cuotas_api(api_key, sport_key):
         "bookmakers": ODDS_BOOKMAKERS,
     }
     try:
-        response = requests.get(url, params=params, timeout=15)
-        restantes = response.headers.get("x-requests-remaining")
-        usados = response.headers.get("x-requests-used")
-        if restantes is not None:
-            st.session_state["odds_api_uso"] = {"restantes": restantes, "usados": usados}
+        response = requests.get(url, params=params, timeout=12)
+        headers_uso = {
+            "restantes": response.headers.get("x-requests-remaining"),
+            "usados": response.headers.get("x-requests-used"),
+        }
         if response.status_code == 401:
-            st.error(f"❌ API Key inválida al consultar {sport_key}.")
-            return []
+            return [], headers_uso
         if response.status_code == 422:
             params.pop("bookmakers", None)
-            response = requests.get(url, params=params, timeout=15)
+            response = requests.get(url, params=params, timeout=12)
+            headers_uso = {
+                "restantes": response.headers.get("x-requests-remaining"),
+                "usados": response.headers.get("x-requests-used"),
+            }
             if response.status_code != 200:
-                return []
+                return [], headers_uso
         if response.status_code == 429:
-            st.warning(f"⚠️ Rate limit en {sport_key}, se omite.")
-            return []
+            return [], headers_uso
         response.raise_for_status()
-        return response.json()
+        return response.json(), headers_uso
     except Exception:
-        return []
+        return [], {}
+
+
+def _aplicar_headers_odds(headers_uso):
+    if headers_uso and headers_uso.get("restantes") is not None:
+        st.session_state["odds_api_uso"] = headers_uso
 
 
 def devig_probabilidades(outcomes):
@@ -895,9 +920,21 @@ def _pasa_whitelist(sport_key):
     return any(sk.startswith(p.lower()) or p.lower() in sk for p in SPORTS_WHITELIST_PREFIXES)
 
 
+def _pasa_prioridad_all(sport_key):
+    if not ALL_SPORTS_PRIORITY:
+        return True
+    if not sport_key:
+        return False
+    sk = sport_key.lower()
+    return any(sk.startswith(p.lower()) for p in ALL_SPORTS_PRIORITY)
+
+
 def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_DEFAULT):
     if not datos_crudos or not isinstance(datos_crudos, list):
         return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
+
+    # UNA sola precarga ClubElo (evita N × timeout)
+    df_clubelo_cache = obtener_fixtures_clubelo(None)
 
     eventos_validos = []
     c = dict(
@@ -921,6 +958,7 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
             away_team=away_team,
             estado_elo=estado_elo,
             commence_utc=commence_str,
+            df_clubelo=df_clubelo_cache,
         )
         if registry_entry["cobertura"] == "excluido_estructural":
             c["estructural"] += 1
@@ -1009,6 +1047,7 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
 
         eventos_validos.append(evento_minificado)
 
+    clubelo_ok = "sí" if df_clubelo_cache is not None else "no (timeout/sin datos)"
     resumen = (
         f"Backend pre-filtró {len(datos_crudos)} eventos: "
         f"{len(eventos_validos)} candidatos (prx {horas_ventana}h, cuota {CUOTA_MIN}-{CUOTA_MAX}), "
@@ -1018,7 +1057,8 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
         f"De los candidatos: {c['elo']} Elo interno, {c['backend']} ClubElo/backend, "
         f"{c['pendiente']} pendiente, {c['ev_oficial']} con EV oficial, "
         f"{c['ev_proxy']} con EV proxy (consenso), "
-        f"{c['proxy_5b']} elegibles para Casi-calificó 5b."
+        f"{c['proxy_5b']} elegibles para Casi-calificó 5b. "
+        f"ClubElo precarga: {clubelo_ok}."
     )
     return eventos_validos, resumen
 
@@ -1195,8 +1235,8 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
 st.title(
-    "📊 Analista de Apuesta Única v3.8 "
-    "(más casas · ClubElo reforzado · proxy 5b · Multi-IA)"
+    "📊 Analista de Apuesta Única v3.8.1 "
+    "(ClubElo rápido · proxy 5b · Multi-IA)"
 )
 
 with st.sidebar:
@@ -1266,6 +1306,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"Forebet: {'ON' if ENABLE_FOREBET else 'OFF'}")
+    st.caption(f"ClubElo timeout: {CLUBELO_TIMEOUT}s")
     st.caption(
         f"EV≥{EV_MINIMO*100:.0f}% · Div≤{DIVERGENCIA_MAXIMA*100:.0f}% · Conf≥{CONFIANZA_MINIMA}"
     )
@@ -1273,6 +1314,8 @@ with st.sidebar:
         f"Proxy 5b: div≤{CONSENSO_DIVERGENCIA_CERCANIA*100:.0f}% "
         f"o EV≥{CONSENSO_EV_CERCANIA*100:.0f}% · min casas={CONSENSO_MIN_CASAS}"
     )
+    if ALL_SPORTS_PRIORITY:
+        st.caption(f"ALL prioriza: {', '.join(ALL_SPORTS_PRIORITY)}")
 
 if api_key:
     deportes_lista = obtener_deportes_activos(api_key)
@@ -1293,20 +1336,29 @@ if api_key:
 
         if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
             st.session_state.pop("clubelo_match_failures", None)
-            with st.spinner("Odds API + ClubElo + Elo + consenso de mercado + EV..."):
+            with st.spinner("Odds API + ClubElo (1 precarga) + Elo + consenso + EV..."):
                 datos = []
                 if deporte_key == "ALL":
-                    deps = [d for d in deportes_lista if _pasa_whitelist(d.get("key"))]
+                    deps = [
+                        d for d in deportes_lista
+                        if _pasa_whitelist(d.get("key")) and _pasa_prioridad_all(d.get("key"))
+                    ]
                     bar = st.progress(0)
+                    status = st.empty()
                     for i, dep in enumerate(deps):
-                        cuotas = obtener_cuotas_api(api_key, dep.get("key"))
+                        status.caption(f"Consultando {dep.get('key')} ({i+1}/{len(deps)})…")
+                        cuotas, headers_uso = obtener_cuotas_api(api_key, dep.get("key"))
+                        _aplicar_headers_odds(headers_uso)
                         if cuotas:
                             datos.extend(cuotas)
                         bar.progress((i + 1) / max(len(deps), 1))
-                        time.sleep(0.15)
+                        time.sleep(ALL_SPORTS_SLEEP)
                     bar.empty()
+                    status.empty()
                 else:
-                    datos = obtener_cuotas_api(api_key, deporte_key)
+                    cuotas, headers_uso = obtener_cuotas_api(api_key, deporte_key)
+                    _aplicar_headers_odds(headers_uso)
+                    datos = cuotas or []
 
                 estado_elo = cargar_estado_elo()
                 for sk in {ev.get("sport_key") for ev in datos if isinstance(ev, dict)}:
