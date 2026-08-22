@@ -1,18 +1,6 @@
 """
-Analista de Apuesta Única — v3.7
-
-Requisitos (requirements.txt):
-    streamlit
-    pandas
-    beautifulsoup4
-    requests
-
-Cambios v3.6 -> v3.7 (fix "Casi calificó" vacío):
-  [C1] Consenso de mercado (de-vig de casas no-Pinnacle) como proxy cuantitativo.
-  [C2] Precálculo de EV% y divergencia vs consenso cuando no hay 2º modelo oficial.
-  [C3] Prompt: sección CASI CALIFICÓ en dos bloques (5a numérico / 5b bloqueados por fuente).
-  [C4] El proxy NUNCA permite pick del día (confianza tope documentada < 8).
-  [C5] Tabla de candidatos muestra EV oficial y EV proxy.
+Analista de Apuesta Única — v3.7 (fix Brier sidebar)
+Requisitos: streamlit, pandas, beautifulsoup4, requests
 """
 
 import json
@@ -28,7 +16,7 @@ import requests
 import streamlit as st
 
 # ==============================================================================
-# CONSTANTES / UMBRALES
+# CONSTANTES
 # ==============================================================================
 EV_MINIMO = 0.04
 DIVERGENCIA_MAXIMA = 0.09
@@ -37,11 +25,10 @@ CUOTA_MIN = 1.40
 CUOTA_MAX = 2.00
 VENTANA_HORAS_DEFAULT = 24
 
-# Proxy de consenso (solo ranking / casi-calificó; NUNCA pick oficial)
 CONSENSO_MIN_CASAS = 2
-CONSENSO_DIVERGENCIA_CERCANIA = 0.06   # ≤6% → candidato a 5b
-CONSENSO_EV_CERCANIA = 0.02            # EV teórico ≥2% → candidato a 5b
-CONFIANZA_TOPE_CONSENSO = 7            # nunca ≥8 solo con consenso
+CONSENSO_DIVERGENCIA_CERCANIA = 0.06
+CONSENSO_EV_CERCANIA = 0.02
+CONFIANZA_TOPE_CONSENSO = 7
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -55,171 +42,73 @@ GEMINI_TOKEN_WARNING = 500_000
 CLAUDE_WEB_SEARCH_MAX_USES = 8
 
 ENABLE_FOREBET = False
-
 CLUBELO_API_BASE = "http://api.clubelo.com"
 FOREBET_URL = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
-
-SPORTS_WHITELIST_PREFIXES = []  # ej: ["soccer", "baseball_mlb", "tennis"]
-
+SPORTS_WHITELIST_PREFIXES = []
 REGISTRY_ULTIMA_REVISION = "2026-08-22"
 
 # ==============================================================================
-# 1. SYSTEM PROMPT V3.7
+# SYSTEM PROMPT V3.7
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_7 = f"""
 PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.7)
 
-ROL Y OBJETIVO:
-Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
-seleccionar UNA sola apuesta —la de mayor confianza estadística— dentro de un rango
-de cuota {CUOTA_MIN:.2f}-{CUOTA_MAX:.2f} (moneyline o mercado principal), de TODOS
-los eventos recibidos.
-Un informe con 0 picks es un resultado VÁLIDO y ESPERADO en la mayoría de los días.
-Nunca fuerces un pick para "tener algo que mostrar".
+ROL: Selecciona UNA apuesta (cuota {CUOTA_MIN:.2f}-{CUOTA_MAX:.2f}) o 0 picks si nada califica.
+Nunca fuerces un pick.
 
-METODOLOGÍA Y REGLAS CLAVE:
+1. Usa `_pinnacle_devig` sin recalcular.
+1b. Si hay `_backend_ev` (oficial): úsalo. Si hay `_backend_ev_proxy` (consenso):
+    SOLO para sección 5b / ranking. NUNCA pick del día. Confianza tope {CONFIANZA_TOPE_CONSENSO}/10.
+    EV = (prob_modelo * cuota) - 1. Divergencia = |pinnacle_devig - prob_modelo|.
 
-1. ANCLA OBLIGATORIA: Usa directamente `_pinnacle_devig`. No recalcules el de-vig.
+2. Frescura: si faltan <3h al inicio Y last_update >90 min → descarta. Si faltan >3h, no descartes por antigüedad.
 
-1b. PRECÁLCULO BACKEND:
-   - Si existe `_backend_ev` (2º modelo oficial: ClubElo/Elo/externo backend):
-     USA esos números. No los recalcules salvo error manifiesto.
-   - Si existe `_backend_ev_proxy` (consenso de casas no-Pinnacle):
-     ÚSALO SOLO para ranking de cercanía (sección 5b) y para rellenar tablas
-     de transparencia cuando no hubo fuente oficial. NUNCA como base de un
-     pick del día con confianza >= {CONFIANZA_MINIMA}.
-   Fórmulas de referencia:
-     EV% = (prob_modelo * cuota_pinnacle) - 1
-     Divergencia% = |prob_pinnacle_devig - prob_modelo|
+3. Segundo modelo SOLO vía `_registry_modelo_secundario`:
+   - externa_directa: busca fuente_primaria/secundaria (FanGraphs con ?date=YYYY-MM-DD; ClubElo en api.clubelo.com).
+   - modelo_interno_elo / modelo_externo_backend: usa campos del JSON.
+   - pendiente_desarrollo / excluido_estructural: descarta.
+   PROHIBIDO 538 SPI y fuentes no listadas.
+   Consenso de mercado NO es 2º modelo oficial.
 
-2. GATE DE FRESCURA (relativo al tiempo restante):
-   Compara `_pinnacle_last_update` contra `inicio_utc`:
-   - < 3h para el inicio Y last_update con > 90 min de antigüedad → DESCARTA.
-   - > 3h restantes → la antigüedad es solo informativa; NO descartes por esto.
+3b. Tenis/boxeo/MMA: chequeo lesiones 48-72h.
 
-3. VALIDACIÓN CRUZADA — solo vía `_registry_modelo_secundario`:
-   Según `cobertura`:
+4. Liquidez: <2 casas → no califica.
+5. Umbrales: EV<{EV_MINIMO*100:.0f}% cat4; Div>{DIVERGENCIA_MAXIMA*100:.0f}% cat5; Conf<{CONFIANZA_MINIMA} cat6.
+6. Pick solo si confianza>={CONFIANZA_MINIMA} Y 2º modelo OFICIAL (no proxy).
 
-   - "externa_directa": DEBES buscar en fuente_primaria (URL correcta) o
-     secundaria. Prohibido "no se puede confirmar" sin intento real.
-     FanGraphs: SIEMPRE https://www.fangraphs.com/scores?date=YYYY-MM-DD
-     ClubElo: SIEMPRE api.clubelo.com (nunca clubelo.com sin api).
-     Si falla primaria/secundaria y hay fuente_respaldo documentada, cítala
-     como respaldo. Forebet = caja negra → baja calidad de fuente.
-     Si no hay número verificable → categoría 2.
+Categorías (una sola, en orden): 1 frescura, 2 sin 2º modelo oficial, 3 liquidez, 4 EV, 5 divergencia, 6 confianza.
+Auto-check: suma descartes + (1 si pick) = total eventos del JSON.
 
-   - "modelo_interno_elo": usa probabilidad_elo_home, elo_*, brier_*, muestras_*.
-     Cita: "Modelo Elo interno (backend)...".
-
-   - "modelo_externo_backend": usa probabilidad_home/draw/away. Cita la fuente
-     exacta del registry. Si Forebet, advertencia de metodología.
-
-   - "pendiente_desarrollo" / "excluido_estructural": DESCARTA (cat. 2 o estructural).
-
-   PROHIBIDO: fuentes no listadas en el registry. PROHIBIDO "538 SPI".
-
-   IMPORTANTE — CONSENSO DE MERCADO (`_consenso_mercado_devig` / `_backend_ev_proxy`):
-   NO es un segundo modelo oficial. NO habilita pick del día.
-   Solo sirve para:
-     (a) rellenar señales de cercanía en 5b,
-     (b) contextualizar eventos en cat. 2 que sí tienen liquidez y frescura.
-   Confianza máxima si alguien lo usara mal: {CONFIANZA_TOPE_CONSENSO}/10
-   (y aun así NO debe ser el pick).
-
-3b. CHEQUEO FÍSICO — obligatorio tenis / boxeo / MMA (últimas 48-72h).
-   Noticia real → baja confianza. Sin hallazgos → decláralo explícitamente.
-
-4. LIQUIDEZ: `_liquidez_backend`. < 2 casas → no califica.
-
-5. UMBRALES (versionados en backend):
-   - EV < {EV_MINIMO * 100:.0f}% → descartar (cat. 4)
-   - Divergencia > {DIVERGENCIA_MAXIMA * 100:.0f}% → descartar (cat. 5)
-   - Elo interno con brier > 0.23 o muestras < 8 → descartar
-   - Confianza < {CONFIANZA_MINIMA}/10 → cat. 6
-   El proxy de consenso NO entra en el cálculo del pick del día.
-
-6. CONFIANZA (1-10): edge, calidad de fuente, liquidez, línea, (físico si aplica).
-   Solo pick si total >= {CONFIANZA_MINIMA}/10 Y el 2º modelo es oficial
-   (no consenso de mercado).
-
-REGLAS ANTI-FABRICACIÓN:
-- Nunca inventes datos, lesiones, cuotas ni fuentes.
-- Cat. 1/2/3 sin cálculo oficial: EV/divergencia = "N/A — no se calculó"
-  (salvo que reportes el proxy claramente etiquetado como "proxy consenso").
-- fuente_respaldo solo tras intentar primaria/secundaria de verdad.
-
-CATEGORÍAS DE DESCARTE (mutuamente excluyentes, en orden):
-   1º Frescura
-   2º Segundo modelo oficial no disponible
-   3º Liquidez
-   4º EV bajo umbral (solo si hubo 2º modelo oficial)
-   5º Divergencia alta (solo si hubo 2º modelo oficial)
-   6º Confianza < {CONFIANZA_MINIMA}
-Un evento en exactamente UNA categoría.
-
-AUTO-VERIFICACIÓN:
-suma(descartes por cat.) + (1 si hay pick else 0) = total de eventos del JSON
-de ESTE prompt.
-
-FORMATO DE SALIDA (obligatorio, en español):
-1. Resumen: N eventos + desglose exacto por las 6 categorías + verificación de suma.
-2. Si hay pick: Partido | Mercado | Cuota Pinnacle | Prob. de-vig | Prob. 2º modelo
-   (fuente oficial) | EV% | Confianza (desglose) | Justificación 3-4 líneas.
-3. Si NO hay pick: "PICK DEL DÍA: NINGUNO" + explicación breve por categoría.
-4. TABLA DE TRANSPARENCIA — solo cat. 4, 5 y 6 (con 2º modelo oficial calculado):
-   | Partido | Categoría | EV% | Divergencia% | Confianza | Motivo breve |
-
-5. CASI CALIFICÓ — DOS subsecciones obligatorias:
-
-   5a. CON CÁLCULO NUMÉRICO OFICIAL (categorías 4, 5 y 6):
-   Hasta 3 eventos que estuvieron más cerca de pasar TODOS los umbrales.
-   | Partido | Qué faltó | Qué tan cerca (número exacto vs umbral) |
-   Si no hay ninguno: "Ningún evento con EV/divergencia oficiales estuvo cerca del umbral."
-
-   5b. BLOQUEADOS POR SEGUNDO MODELO OFICIAL (categoría 2 con señal cuantitativa):
-   Hasta 3 eventos que SÍ pasaron frescura, liquidez y rango de cuota, pero
-   NO tuvieron 2º modelo oficial, Y que traen `_backend_ev_proxy` u otra señal:
-   - divergencia |Pinnacle − consenso| ≤ {CONSENSO_DIVERGENCIA_CERCANIA * 100:.0f}%, o
-   - EV teórico vs consenso ≥ {CONSENSO_EV_CERCANIA * 100:.0f}%.
-   | Partido | Qué faltó (fuente oficial) | Señal de cercanía (proxy) |
-   Estos eventos NUNCA son el pick del día.
-   Si no hay ninguno con señal cuantitativa: "No hay eventos en cat. 2 con
-   proxy de mercado suficiente para rankear cercanía."
+FORMATO:
+1. Resumen + 6 categorías + verificación.
+2. Pick o "PICK DEL DÍA: NINGUNO".
+3. Tabla transparencia solo cat 4/5/6.
+5a. CASI CALIFICÓ con números oficiales (cat 4/5/6).
+5b. CASI CALIFICÓ bloqueados por fuente (cat2) con `_backend_ev_proxy` si div<=6% o EV proxy>=2%. Nunca son pick.
 """
 
-# ==============================================================================
-# 1b. MODEL REGISTRY
-# ==============================================================================
 MODEL_REGISTRY = [
     {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
-    {"patron": "soccer", "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures)",
-     "fuente_secundaria": None,
+    {"patron": "soccer", "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures)", "fuente_secundaria": None,
      "fuente_respaldo": "Forebet (sin metodología pública verificable)",
      "cobertura": "externa_directa", "version": "2.1", "usa_elo_interno": False},
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
-     "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
-     "usa_elo_interno": False},
-    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs (usar SIEMPRE ?date=YYYY-MM-DD)",
-     "fuente_secundaria": None,
-     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.1", "usa_elo_interno": False},
+     "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs (usar SIEMPRE ?date=YYYY-MM-DD)", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)", "cobertura": "externa_directa", "version": "1.1", "usa_elo_interno": False},
     {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
     {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
     {"patron": "basketball_nba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
-     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "basketball_wnba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
-     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "basketball_ncaab", "fuente_primaria": "Basketball-Reference (NCAA)", "fuente_secundaria": None,
-     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "icehockey_nhl", "fuente_primaria": "Hockey-Reference", "fuente_secundaria": None,
-     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)", "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "cricket", "fuente_primaria": "ICC Team Ratings", "fuente_secundaria": "ESPN Cricinfo",
      "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
     {"patron": "boxing", "fuente_primaria": "BoxRec ratings", "fuente_secundaria": None,
@@ -235,16 +124,14 @@ DEFAULT_REGISTRY_ENTRY = {
     "cobertura": "pendiente_desarrollo", "version": "0.0", "usa_elo_interno": True,
 }
 
-
 def _buscar_base_registry(sport_key):
     if not sport_key:
         return dict(DEFAULT_REGISTRY_ENTRY)
-    sport_key_low = sport_key.lower()
-    return dict(next((e for e in MODEL_REGISTRY if e["patron"] in sport_key_low), DEFAULT_REGISTRY_ENTRY))
-
+    sk = sport_key.lower()
+    return dict(next((e for e in MODEL_REGISTRY if e["patron"] in sk), DEFAULT_REGISTRY_ENTRY))
 
 # ==============================================================================
-# 1c. MOTOR ELO INTERNO
+# ELO INTERNO
 # ==============================================================================
 try:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -259,7 +146,6 @@ ELO_MIN_MUESTRAS_BRIER = 8
 ELO_BRIER_MAXIMO_ACEPTABLE = 0.23
 ELO_DIAS_HISTORIAL_SCORES = 3
 
-
 def cargar_estado_elo():
     if os.path.exists(ELO_STATE_FILE):
         try:
@@ -269,31 +155,26 @@ def cargar_estado_elo():
             pass
     return {"ratings": {}, "procesados": {}, "historial_brier": {}}
 
-
 def guardar_estado_elo(estado):
     try:
         with open(ELO_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(estado, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        st.warning(f"No se pudo guardar el estado del motor Elo interno: {e}")
-
+        st.warning(f"No se pudo guardar Elo: {e}")
 
 def _prob_elo(elo_a, elo_b):
     return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
-
 
 def calcular_brier(historial_sport):
     if not historial_sport:
         return None
     return sum((h["prob"] - h["resultado"]) ** 2 for h in historial_sport) / len(historial_sport)
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def obtener_scores_api(api_key, sport_key, dias=ELO_DIAS_HISTORIAL_SCORES):
     url = f"{ODDS_API_BASE}/sports/{sport_key}/scores/"
-    params = {"apiKey": api_key, "daysFrom": dias}
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params={"apiKey": api_key, "daysFrom": dias}, timeout=10)
         if r.status_code in (401, 422, 429):
             return []
         r.raise_for_status()
@@ -301,77 +182,60 @@ def obtener_scores_api(api_key, sport_key, dias=ELO_DIAS_HISTORIAL_SCORES):
     except Exception:
         return []
 
-
 def actualizar_elo_sport(api_key, sport_key, estado):
     resultados = obtener_scores_api(api_key, sport_key)
     if not resultados:
         return estado
-
     ratings = estado["ratings"].setdefault(sport_key, {})
     procesados = set(estado["procesados"].setdefault(sport_key, []))
     historial = estado["historial_brier"].setdefault(sport_key, [])
-
     for evento in resultados:
         if not isinstance(evento, dict) or not evento.get("completed"):
             continue
         game_id = evento.get("id")
         if not game_id or game_id in procesados:
             continue
-
-        home_team = evento.get("home_team")
-        away_team = evento.get("away_team")
-        scores = evento.get("scores")
+        home_team, away_team, scores = evento.get("home_team"), evento.get("away_team"), evento.get("scores")
         if not home_team or not away_team or not scores:
             continue
-
         try:
             score_home = next(float(s["score"]) for s in scores if s.get("name") == home_team)
             score_away = next(float(s["score"]) for s in scores if s.get("name") == away_team)
         except (StopIteration, ValueError, TypeError, KeyError):
             continue
-
         resultado_home = 0.5 if score_home == score_away else (1.0 if score_home > score_away else 0.0)
-
         home = ratings.setdefault(home_team, {"elo": ELO_INICIAL, "partidos": 0})
         away = ratings.setdefault(away_team, {"elo": ELO_INICIAL, "partidos": 0})
-
         ventaja = 0.0 if sport_key and "mma" in sport_key.lower() else ELO_VENTAJA_LOCAL
         prob_home_pre = _prob_elo(home["elo"] + ventaja, away["elo"])
-
         home["elo"] += ELO_K_FACTOR * (resultado_home - prob_home_pre)
         away["elo"] += ELO_K_FACTOR * ((1 - resultado_home) - (1 - prob_home_pre))
         home["partidos"] += 1
         away["partidos"] += 1
-
         historial.append({"prob": prob_home_pre, "resultado": resultado_home})
         procesados.add(game_id)
-
     estado["procesados"][sport_key] = list(procesados)
     return estado
 
-
 def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
     ratings = estado.get("ratings", {}).get(sport_key, {})
-    home = ratings.get(home_team)
-    away = ratings.get(away_team)
+    home, away = ratings.get(home_team), ratings.get(away_team)
     historial = estado.get("historial_brier", {}).get(sport_key, [])
     brier = calcular_brier(historial)
-
-    calidad_suficiente = (
-        home is not None and away is not None
+    ok = (
+        home and away
         and home["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
         and away["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
         and brier is not None
         and len(historial) >= ELO_MIN_MUESTRAS_BRIER
         and brier <= ELO_BRIER_MAXIMO_ACEPTABLE
     )
-    if not calidad_suficiente:
+    if not ok:
         return None
-
     ventaja = 0.0 if sport_key and "mma" in sport_key.lower() else ELO_VENTAJA_LOCAL
     prob_home = _prob_elo(home["elo"] + ventaja, away["elo"])
     return {
-        "fuente_primaria": "Modelo Elo interno (backend, calculado desde resultados reales vía Odds API /scores)",
+        "fuente_primaria": "Modelo Elo interno (backend)",
         "fuente_secundaria": None,
         "cobertura": "modelo_interno_elo",
         "version": "1.1",
@@ -385,9 +249,8 @@ def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
         "muestras_brier": len(historial),
     }
 
-
 # ==============================================================================
-# 1d. CLUBELO — matching + fixtures
+# CLUBELO
 # ==============================================================================
 CLUBELO_NAME_ALIASES = {
     "manchester united": "Man United", "manchester city": "Man City",
@@ -396,11 +259,11 @@ CLUBELO_NAME_ALIASES = {
     "nottingham forest": "Forest", "brighton and hove albion": "Brighton",
     "brighton & hove albion": "Brighton", "west ham united": "West Ham",
     "newcastle united": "Newcastle", "leicester city": "Leicester",
-    "leeds united": "Leeds", "aston villa": "Aston Villa",
-    "crystal palace": "Crystal Palace", "sheffield united": "Sheffield United",
-    "ipswich town": "Ipswich", "southampton": "Southampton", "fulham": "Fulham",
-    "brentford": "Brentford", "bournemouth": "Bournemouth", "afc bournemouth": "Bournemouth",
-    "everton": "Everton", "chelsea": "Chelsea", "arsenal": "Arsenal", "liverpool": "Liverpool",
+    "leeds united": "Leeds", "aston villa": "Aston Villa", "crystal palace": "Crystal Palace",
+    "sheffield united": "Sheffield United", "ipswich town": "Ipswich", "southampton": "Southampton",
+    "fulham": "Fulham", "brentford": "Brentford", "bournemouth": "Bournemouth",
+    "afc bournemouth": "Bournemouth", "everton": "Everton", "chelsea": "Chelsea",
+    "arsenal": "Arsenal", "liverpool": "Liverpool",
     "atletico madrid": "Atletico", "atlético madrid": "Atletico", "atletico de madrid": "Atletico",
     "real madrid": "Real Madrid", "barcelona": "Barcelona", "fc barcelona": "Barcelona",
     "real sociedad": "Sociedad", "athletic club": "Athletic", "athletic bilbao": "Athletic",
@@ -444,12 +307,10 @@ CLUBELO_NAME_ALIASES = {
     "young boys": "Young Boys", "club brugge": "Club Brugge", "anderlecht": "Anderlecht",
 }
 
-
-def _strip_accents(s: str) -> str:
+def _strip_accents(s):
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
-
-def _normalizar_nombre(nombre: str) -> str:
+def _normalizar_nombre(nombre):
     if not nombre:
         return ""
     s = _strip_accents(nombre).lower().strip()
@@ -460,13 +321,11 @@ def _normalizar_nombre(nombre: str) -> str:
             s = s[: -len(tok)].strip()
     return s
 
-
-def _tokens(nombre: str) -> set:
+def _tokens(nombre):
     stop = {"fc", "cf", "afc", "sc", "ac", "as", "the", "de", "club", "united", "city"}
     return {t for t in _normalizar_nombre(nombre).split() if t and t not in stop}
 
-
-def resolver_nombre_clubelo(nombre_odds: str, nombres_clubelo_disponibles=None):
+def resolver_nombre_clubelo(nombre_odds, nombres_clubelo_disponibles=None):
     if not nombre_odds:
         return None, "vacio"
     key = _normalizar_nombre(nombre_odds)
@@ -479,14 +338,13 @@ def resolver_nombre_clubelo(nombre_odds: str, nombres_clubelo_disponibles=None):
         norm_map = {_normalizar_nombre(n): n for n in nombres_clubelo_disponibles}
         if key in norm_map:
             return norm_map[key], "exacto_normalizado"
-        tok_query = _tokens(nombre_odds)
+        tok_q = _tokens(nombre_odds)
         best, best_score = None, 0.0
-        for _, original in norm_map.items():
+        for original in norm_map.values():
             tok_n = _tokens(original)
-            if not tok_query or not tok_n:
+            if not tok_q or not tok_n:
                 continue
-            inter = len(tok_query & tok_n)
-            union = len(tok_query | tok_n)
+            inter, union = len(tok_q & tok_n), len(tok_q | tok_n)
             score = inter / union if union else 0.0
             if score > best_score:
                 best_score, best = score, original
@@ -494,14 +352,12 @@ def resolver_nombre_clubelo(nombre_odds: str, nombres_clubelo_disponibles=None):
             return best, f"fuzzy_{best_score:.2f}"
     return None, "sin_match"
 
-
 def _log_clubelo_failure(home, away, reason):
     fails = st.session_state.setdefault("clubelo_match_failures", [])
     entry = f"{home} vs {away} — {reason}"
     if entry not in fails:
         fails.append(entry)
         st.session_state["clubelo_match_failures"] = fails[-50:]
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def obtener_fixtures_clubelo():
@@ -516,7 +372,6 @@ def obtener_fixtures_clubelo():
     except Exception:
         return None
 
-
 def _es_columna_gd(nombre_columna):
     try:
         int(str(nombre_columna).strip())
@@ -524,79 +379,66 @@ def _es_columna_gd(nombre_columna):
     except (ValueError, TypeError):
         return False
 
-
 def _prob_desde_fixtures_clubelo(df, home_team, away_team):
     if df is None or df.empty or "Home" not in df.columns or "Away" not in df.columns:
         return None
-
     todos = list(set(
         df["Home"].dropna().astype(str).unique().tolist()
         + df["Away"].dropna().astype(str).unique().tolist()
     ))
-    home_resuelto, metodo_h = resolver_nombre_clubelo(home_team, todos)
-    away_resuelto, metodo_a = resolver_nombre_clubelo(away_team, todos)
-    if not home_resuelto or not away_resuelto:
-        _log_clubelo_failure(home_team, away_team, f"match fallido (home={metodo_h}, away={metodo_a})")
+    home_r, mh = resolver_nombre_clubelo(home_team, todos)
+    away_r, ma = resolver_nombre_clubelo(away_team, todos)
+    if not home_r or not away_r:
+        _log_clubelo_failure(home_team, away_team, f"match fallido ({mh}/{ma})")
         return None
-
     try:
         match = df[
-            (df["Home"].astype(str).str.strip().str.lower() == home_resuelto.strip().lower())
-            & (df["Away"].astype(str).str.strip().str.lower() == away_resuelto.strip().lower())
+            (df["Home"].astype(str).str.strip().str.lower() == home_r.strip().lower())
+            & (df["Away"].astype(str).str.strip().str.lower() == away_r.strip().lower())
         ]
         invertido = False
         if match.empty:
             match = df[
-                (df["Home"].astype(str).str.strip().str.lower() == away_resuelto.strip().lower())
-                & (df["Away"].astype(str).str.strip().str.lower() == home_resuelto.strip().lower())
+                (df["Home"].astype(str).str.strip().str.lower() == away_r.strip().lower())
+                & (df["Away"].astype(str).str.strip().str.lower() == home_r.strip().lower())
             ]
             invertido = not match.empty
         if match.empty:
-            _log_clubelo_failure(
-                home_team, away_team,
-                f"resueltos a '{home_resuelto}'/'{away_resuelto}' pero no en Fixtures"
-            )
+            _log_clubelo_failure(home_team, away_team, f"no en Fixtures ({home_r}/{away_r})")
             return None
-
         row = match.iloc[0]
         cols_gd = [c for c in df.columns if _es_columna_gd(c)]
         if not cols_gd:
             return None
-
-        prob_home = prob_away = prob_draw = 0.0
+        ph = pa = pd_ = 0.0
         for c in cols_gd:
             try:
-                val = float(row[c])
-                gd = int(str(c).strip())
+                val, gd = float(row[c]), int(str(c).strip())
             except (ValueError, TypeError):
                 continue
             if gd > 0:
-                prob_home += val
+                ph += val
             elif gd < 0:
-                prob_away += val
+                pa += val
             else:
-                prob_draw += val
-
+                pd_ += val
         if invertido:
-            prob_home, prob_away = prob_away, prob_home
-
-        total = prob_home + prob_draw + prob_away
+            ph, pa = pa, ph
+        total = ph + pd_ + pa
         if total <= 0 or abs(total - 1.0) > 0.02:
-            _log_clubelo_failure(home_team, away_team, f"probs no suman 1 (suma={total:.4f})")
+            _log_clubelo_failure(home_team, away_team, f"suma probs={total:.4f}")
             return None
-
         return {
-            "prob_home": round(float(prob_home / total), 4),
-            "prob_draw": round(float(prob_draw / total), 4),
-            "prob_away": round(float(prob_away / total), 4),
-            "clubelo_home": home_resuelto,
-            "clubelo_away": away_resuelto,
-            "match_method": f"{metodo_h}/{metodo_a}",
+            "prob_home": round(ph / total, 4),
+            "prob_draw": round(pd_ / total, 4),
+            "prob_away": round(pa / total, 4),
+            "clubelo_home": home_r,
+            "clubelo_away": away_r,
+            "match_method": f"{mh}/{ma}",
         }
     except Exception as e:
         _log_clubelo_failure(home_team, away_team, f"excepción: {e}")
         return None
-
 
 def obtener_prediccion_forebet(home_team, away_team):
     if not ENABLE_FOREBET:
@@ -606,29 +448,20 @@ def obtener_prediccion_forebet(home_team, away_team):
     except ImportError:
         return None
     try:
-        r = requests.get(
-            FOREBET_URL, timeout=12,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.7)"},
-        )
+        r = requests.get(FOREBET_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/3.7)"})
         r.raise_for_status()
-    except Exception:
-        return None
-    try:
         soup = BeautifulSoup(r.text, "html.parser")
         filas = soup.select("div.rcnt") or soup.select(".rcnt")
-        home_n = _normalizar_nombre(home_team)
-        away_n = _normalizar_nombre(away_team)
+        hn, an = _normalizar_nombre(home_team), _normalizar_nombre(away_team)
         for fila in filas:
-            home_el = fila.select_one(".homeTeam") or fila.select_one("span.homeTeam")
-            away_el = fila.select_one(".awayTeam") or fila.select_one("span.awayTeam")
-            if home_el and away_el:
-                if home_n not in _normalizar_nombre(home_el.get_text()):
-                    continue
-                if away_n not in _normalizar_nombre(away_el.get_text()):
+            he = fila.select_one(".homeTeam") or fila.select_one("span.homeTeam")
+            ae = fila.select_one(".awayTeam") or fila.select_one("span.awayTeam")
+            if he and ae:
+                if hn not in _normalizar_nombre(he.get_text()) or an not in _normalizar_nombre(ae.get_text()):
                     continue
             else:
-                texto = _normalizar_nombre(fila.get_text(" ", strip=True))
-                if home_n not in texto or away_n not in texto:
+                tx = _normalizar_nombre(fila.get_text(" ", strip=True))
+                if hn not in tx or an not in tx:
                     continue
             probs = []
             fprc = fila.select_one(".fprc")
@@ -642,23 +475,21 @@ def obtener_prediccion_forebet(home_team, away_team):
             if len(probs) < 3:
                 continue
             try:
-                ph, pd_, pa = [float(x) / 100.0 for x in probs[:3]]
+                a, b, c = [float(x) / 100.0 for x in probs[:3]]
             except ValueError:
                 continue
-            if abs(ph + pd_ + pa - 1.0) > 0.05:
+            if abs(a + b + c - 1.0) > 0.05:
                 continue
-            return {"prob_home": round(ph, 4), "prob_draw": round(pd_, 4), "prob_away": round(pa, 4)}
+            return {"prob_home": round(a, 4), "prob_draw": round(b, 4), "prob_away": round(c, 4)}
     except Exception:
         return None
     return None
 
-
 def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
     if not sport_key or not sport_key.startswith("soccer") or not home_team or not away_team:
         return None
-    fixtures = obtener_fixtures_clubelo()
-    resultado_clubelo = _prob_desde_fixtures_clubelo(fixtures, home_team, away_team)
-    if resultado_clubelo:
+    res = _prob_desde_fixtures_clubelo(obtener_fixtures_clubelo(), home_team, away_team)
+    if res:
         return {
             "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures) — resuelto directo por backend",
             "fuente_secundaria": None,
@@ -666,39 +497,35 @@ def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
             "cobertura": "modelo_externo_backend",
             "version": "1.1",
             "ultima_revision": REGISTRY_ULTIMA_REVISION,
-            "probabilidad_home": resultado_clubelo["prob_home"],
-            "probabilidad_draw": resultado_clubelo["prob_draw"],
-            "probabilidad_away": resultado_clubelo["prob_away"],
-            "clubelo_match": resultado_clubelo.get("match_method"),
-            "clubelo_nombres": f"{resultado_clubelo.get('clubelo_home')} vs {resultado_clubelo.get('clubelo_away')}",
+            "probabilidad_home": res["prob_home"],
+            "probabilidad_draw": res["prob_draw"],
+            "probabilidad_away": res["prob_away"],
+            "clubelo_match": res.get("match_method"),
+            "clubelo_nombres": f"{res.get('clubelo_home')} vs {res.get('clubelo_away')}",
         }
     if ENABLE_FOREBET:
-        resultado_forebet = obtener_prediccion_forebet(home_team, away_team)
-        if resultado_forebet:
+        fb = obtener_prediccion_forebet(home_team, away_team)
+        if fb:
             return {
-                "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures) — sin dato para este partido",
+                "fuente_primaria": "ClubElo — sin dato",
                 "fuente_secundaria": None,
-                "fuente_respaldo": (
-                    "Forebet (respaldo documentado, sin metodología pública verificable) "
-                    "— resuelto directo por backend"
-                ),
+                "fuente_respaldo": "Forebet (respaldo, sin metodología pública) — backend",
                 "cobertura": "modelo_externo_backend",
                 "version": "1.1",
                 "ultima_revision": REGISTRY_ULTIMA_REVISION,
-                "probabilidad_home": resultado_forebet["prob_home"],
-                "probabilidad_draw": resultado_forebet["prob_draw"],
-                "probabilidad_away": resultado_forebet["prob_away"],
+                "probabilidad_home": fb["prob_home"],
+                "probabilidad_draw": fb["prob_draw"],
+                "probabilidad_away": fb["prob_away"],
                 "metodologia_publica_respaldo": False,
             }
     return None
 
-
 def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
     base = _buscar_base_registry(sport_key)
     if sport_key and sport_key.startswith("soccer") and home_team and away_team:
-        resuelto = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team)
-        if resuelto:
-            return resuelto
+        r = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team)
+        if r:
+            return r
     if (
         base.get("usa_elo_interno")
         and base["cobertura"] == "pendiente_desarrollo"
@@ -709,15 +536,12 @@ def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_e
         if interno:
             return interno
         ratings = estado_elo.get("ratings", {}).get(sport_key, {})
-        ph = ratings.get(home_team, {}).get("partidos", 0)
-        pa = ratings.get(away_team, {}).get("partidos", 0)
         base["nota"] = (
-            f"Elo interno insuficiente ({home_team}: {ph}, {away_team}: {pa}, "
-            f"mín: {ELO_MIN_PARTIDOS_POR_EQUIPO})."
+            f"Elo insuficiente ({home_team}: {ratings.get(home_team, {}).get('partidos', 0)}, "
+            f"{away_team}: {ratings.get(away_team, {}).get('partidos', 0)})"
         )
     base["ultima_revision"] = REGISTRY_ULTIMA_REVISION
     return base
-
 
 # ==============================================================================
 # 2. BACKEND — Odds API + consenso + EV
@@ -789,7 +613,10 @@ def calcular_dispersion_mercado(evento):
     for b in evento.get("bookmakers", []):
         if not isinstance(b, dict):
             continue
-        h2h = next((m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        h2h = next(
+            (m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"),
+            None,
+        )
         if not h2h:
             continue
         for nombre, prob in devig_probabilidades(h2h.get("outcomes", [])).items():
@@ -799,10 +626,7 @@ def calcular_dispersion_mercado(evento):
 
 
 def calcular_consenso_mercado(evento_crudo):
-    """
-    Media de-vig de casas NO Pinnacle (mín. CONSENSO_MIN_CASAS).
-    Proxy para ranking 5b — NUNCA segundo modelo oficial.
-    """
+    """Media de-vig de casas NO Pinnacle. Proxy para 5b — NUNCA 2º modelo oficial."""
     if not isinstance(evento_crudo, dict):
         return None
     probs_por_nombre = {}
@@ -810,7 +634,10 @@ def calcular_consenso_mercado(evento_crudo):
     for b in evento_crudo.get("bookmakers", []):
         if not isinstance(b, dict) or b.get("key") == "pinnacle":
             continue
-        h2h = next((m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        h2h = next(
+            (m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"),
+            None,
+        )
         if not h2h:
             continue
         devig = devig_probabilidades(h2h.get("outcomes", []))
@@ -819,10 +646,8 @@ def calcular_consenso_mercado(evento_crudo):
         casas_usadas.append(b.get("key") or b.get("title") or "unknown")
         for nombre, p in devig.items():
             probs_por_nombre.setdefault(nombre, []).append(p)
-
     if len(casas_usadas) < CONSENSO_MIN_CASAS:
         return None
-
     consenso = {
         nombre: round(sum(vals) / len(vals), 4)
         for nombre, vals in probs_por_nombre.items()
@@ -873,7 +698,6 @@ def _precalc_desde_probs(cuotas, devig_pinnacle, probs_modelo):
 
 
 def precalcular_ev_oficial(evento_minificado):
-    """EV/divergencia con 2º modelo oficial (ClubElo / Elo interno / backend)."""
     registry = evento_minificado.get("_registry_modelo_secundario") or {}
     cobertura = registry.get("cobertura")
     cuotas = evento_minificado.get("cuotas_pinnacle") or {}
@@ -908,7 +732,6 @@ def precalcular_ev_oficial(evento_minificado):
 
 
 def precalcular_ev_proxy(evento_minificado, consenso):
-    """EV/divergencia vs consenso de mercado — solo ranking 5b."""
     if not consenso or not consenso.get("probs"):
         return None
     out = _precalc_desde_probs(
@@ -921,7 +744,6 @@ def precalcular_ev_proxy(evento_minificado, consenso):
     out["tipo"] = "proxy_consenso"
     out["fuente"] = f"Consenso {consenso.get('n_casas')} casas: {', '.join(consenso.get('casas', []))}"
     out["nota"] = consenso.get("nota")
-    # señal de cercanía para 5b
     me = out.get("mejor_ev")
     md = out.get("mejor_divergencia")
     out["senal_cercania_5b"] = bool(
@@ -989,7 +811,10 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
         home_team = evento.get("home_team")
         away_team = evento.get("away_team")
         registry_entry = obtener_entrada_registry(
-            evento.get("sport_key"), home_team=home_team, away_team=away_team, estado_elo=estado_elo
+            evento.get("sport_key"),
+            home_team=home_team,
+            away_team=away_team,
+            estado_elo=estado_elo,
         )
         if registry_entry["cobertura"] == "excluido_estructural":
             c["estructural"] += 1
@@ -1062,13 +887,11 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=VENTANA_HORAS_D
             "_registry_modelo_secundario": registry_entry,
         }
 
-        # EV oficial
         pre_oficial = precalcular_ev_oficial(evento_minificado)
         if pre_oficial:
             evento_minificado["_backend_ev"] = pre_oficial
             c["ev_oficial"] += 1
 
-        # Consenso + EV proxy (siempre que haya ≥2 casas no-Pinnacle)
         consenso = calcular_consenso_mercado(evento)
         if consenso:
             evento_minificado["_consenso_mercado_devig"] = consenso
@@ -1261,9 +1084,8 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
     }
     return "\n\n".join(partes), [q for q in queries if q], uso, ratelimit
 
-
 # ==============================================================================
-# 4. INTERFAZ
+# 4. INTERFAZ STREAMLIT
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
@@ -1289,7 +1111,10 @@ with st.sidebar:
     if "odds_api_uso" in st.session_state:
         try:
             restantes = int(st.session_state["odds_api_uso"]["restantes"])
-            icono = "🟢" if restantes > ODDS_YELLOW_THRESHOLD else ("🟡" if restantes > ODDS_RED_THRESHOLD else "🔴")
+            icono = (
+                "🟢" if restantes > ODDS_YELLOW_THRESHOLD
+                else ("🟡" if restantes > ODDS_RED_THRESHOLD else "🔴")
+            )
             st.metric(f"{icono} The Odds API — restantes", restantes)
             if restantes <= ODDS_RED_THRESHOLD:
                 st.warning("⚠️ Pocas requests en The Odds API.")
@@ -1321,18 +1146,29 @@ with st.sidebar:
             for f in st.session_state["clubelo_match_failures"][-15:]:
                 st.caption(f)
 
+    # FIX Brier: no usar {brier:.4f if ...} dentro del f-string
     estado_elo_sidebar = cargar_estado_elo()
     if estado_elo_sidebar.get("ratings"):
         with st.expander("🧠 Motor Elo interno"):
             for sk, ratings in estado_elo_sidebar["ratings"].items():
-                brier = calcular_brier(estado_elo_sidebar.get("historial_brier", {}).get(sk, []))
+                brier = calcular_brier(
+                    estado_elo_sidebar.get("historial_brier", {}).get(sk, [])
+                )
                 n = len(estado_elo_sidebar.get("historial_brier", {}).get(sk, []))
-                st.write(f"**{sk}** — {len(ratings)} equipos, Brier: {brier:.4f if brier else 'N/A'} ({n})")
+                brier_txt = f"{brier:.4f}" if brier is not None else "N/A"
+                st.write(
+                    f"**{sk}** — {len(ratings)} equipos, Brier: {brier_txt} ({n})"
+                )
 
     st.divider()
     st.caption(f"Forebet: {'ON' if ENABLE_FOREBET else 'OFF'}")
-    st.caption(f"EV≥{EV_MINIMO*100:.0f}% · Div≤{DIVERGENCIA_MAXIMA*100:.0f}% · Conf≥{CONFIANZA_MINIMA}")
-    st.caption(f"Proxy 5b: div≤{CONSENSO_DIVERGENCIA_CERCANIA*100:.0f}% o EV≥{CONSENSO_EV_CERCANIA*100:.0f}%")
+    st.caption(
+        f"EV≥{EV_MINIMO*100:.0f}% · Div≤{DIVERGENCIA_MAXIMA*100:.0f}% · Conf≥{CONFIANZA_MINIMA}"
+    )
+    st.caption(
+        f"Proxy 5b: div≤{CONSENSO_DIVERGENCIA_CERCANIA*100:.0f}% "
+        f"o EV≥{CONSENSO_EV_CERCANIA*100:.0f}%"
+    )
 
 if api_key:
     deportes_lista = obtener_deportes_activos(api_key)
@@ -1379,8 +1215,10 @@ if api_key:
                 eventos, resumen = filtrar_y_enriquecer(datos, estado_elo)
                 movs = registrar_y_calcular_movimientos(eventos, deporte_key)
                 seccion_mov = (
-                    "MOVIMIENTOS PINNACLE:\n" + "\n".join(f"- {k}: {v}" for k, v in movs.items())
-                    if movs else "SIN SNAPSHOT PREVIO EN ESTA SESIÓN."
+                    "MOVIMIENTOS PINNACLE:\n"
+                    + "\n".join(f"- {k}: {v}" for k, v in movs.items())
+                    if movs
+                    else "SIN SNAPSHOT PREVIO EN ESTA SESIÓN."
                 )
 
                 st.write("### 📌 Resumen de Filtrado Backend")
@@ -1399,17 +1237,28 @@ if api_key:
                                 "Cobertura": reg.get("cobertura"),
                                 "Liquidez": ev.get("_liquidez_backend"),
                                 "EV oficial": (
-                                    f"{ofi['mejor_ev']*100:.1f}%" if ofi.get("mejor_ev") is not None else "—"
+                                    f"{ofi['mejor_ev']*100:.1f}%"
+                                    if ofi.get("mejor_ev") is not None
+                                    else "—"
                                 ),
                                 "EV proxy": (
-                                    f"{prx['mejor_ev']*100:.1f}%" if prx.get("mejor_ev") is not None else "—"
+                                    f"{prx['mejor_ev']*100:.1f}%"
+                                    if prx.get("mejor_ev") is not None
+                                    else "—"
                                 ),
-                                "5b?": "Sí" if prx.get("senal_cercania_5b") and not ofi else "—",
+                                "5b?": (
+                                    "Sí"
+                                    if prx.get("senal_cercania_5b") and not ofi
+                                    else "—"
+                                ),
                             })
                         st.dataframe(pd.DataFrame(filas), use_container_width=True)
 
                 if not eventos:
-                    st.warning(f"⚠️ Sin candidatos en rango {CUOTA_MIN}-{CUOTA_MAX} / {VENTANA_HORAS_DEFAULT}h.")
+                    st.warning(
+                        f"⚠️ Sin candidatos en rango {CUOTA_MIN}-{CUOTA_MAX} / "
+                        f"{VENTANA_HORAS_DEFAULT}h."
+                    )
                 elif modo.startswith("Todo en un solo prompt"):
                     for k in ("prompts_por_grupo", "resumen_automatico_grupo", "eventos_por_grupo"):
                         st.session_state.pop(k, None)
@@ -1459,10 +1308,14 @@ if api_key:
         if gemini_api_key:
             st.divider()
             st.subheader("⚡ Gemini API")
-            st.warning("⚠️ Gemini REST en esta app NO busca web. Usa Claude o gemini.google.com.")
+            st.warning(
+                "⚠️ Gemini REST en esta app NO busca web. Usa Claude o gemini.google.com."
+            )
             mods = listar_modelos_gemini(gemini_api_key)
             if mods:
-                default = next((m for m in mods if "flash" in m and "lite" not in m), mods[0])
+                default = next(
+                    (m for m in mods if "flash" in m and "lite" not in m), mods[0]
+                )
                 modelo = st.selectbox("Modelo Gemini:", mods, index=mods.index(default))
                 if st.button("🤖 Analizar con Gemini", type="primary"):
                     with st.spinner(f"Analizando con {modelo}..."):
@@ -1473,7 +1326,8 @@ if api_key:
                             st.markdown("### 🏆 Resultado")
                             st.markdown(res)
                             prev = st.session_state.get(
-                                "gemini_tokens_acumulados", {"prompt": 0, "salida": 0, "total": 0}
+                                "gemini_tokens_acumulados",
+                                {"prompt": 0, "salida": 0, "total": 0},
                             )
                             prev["prompt"] += uso.get("promptTokenCount", 0) or 0
                             prev["salida"] += uso.get("candidatesTokenCount", 0) or 0
@@ -1487,13 +1341,19 @@ if api_key:
             st.subheader("⚡ Claude API (web search forzado)")
             mods_c = listar_modelos_claude(anthropic_api_key)
             if mods_c:
-                default_c = next((m for m in mods_c if "sonnet" in m.lower()), mods_c[0])
-                modelo_c = st.selectbox("Modelo Claude:", mods_c, index=mods_c.index(default_c))
+                default_c = next(
+                    (m for m in mods_c if "sonnet" in m.lower()), mods_c[0]
+                )
+                modelo_c = st.selectbox(
+                    "Modelo Claude:", mods_c, index=mods_c.index(default_c)
+                )
                 if st.button("🤖 Analizar con Claude", type="primary"):
                     with st.spinner(f"Analizando con {modelo_c}..."):
                         try:
                             res, qs, uso, rl = llamar_claude_rest(
-                                anthropic_api_key, modelo_c, st.session_state["prompt_generado"]
+                                anthropic_api_key,
+                                modelo_c,
+                                st.session_state["prompt_generado"],
                             )
                             st.markdown("### 🏆 Resultado")
                             st.markdown(res)
@@ -1506,7 +1366,8 @@ if api_key:
                             ent = uso.get("input_tokens", 0) or 0
                             sal = uso.get("output_tokens", 0) or 0
                             prev = st.session_state.get(
-                                "claude_tokens_acumulados", {"entrada": 0, "salida": 0, "total": 0}
+                                "claude_tokens_acumulados",
+                                {"entrada": 0, "salida": 0, "total": 0},
                             )
                             prev["entrada"] += ent
                             prev["salida"] += sal
@@ -1532,10 +1393,14 @@ if api_key:
             if mods_g:
                 def_g = next((m for m in mods_g if "sonnet" in m.lower()), mods_g[0])
                 modelo_g = st.selectbox(
-                    "Modelo Claude (por deporte):", mods_g,
-                    index=mods_g.index(def_g), key="modelo_por_deporte",
+                    "Modelo Claude (por deporte):",
+                    mods_g,
+                    index=mods_g.index(def_g),
+                    key="modelo_por_deporte",
                 )
-                if st.button("🤖 Analizar TODOS los grupos", type="primary", key="btn_todos"):
+                if st.button(
+                    "🤖 Analizar TODOS los grupos", type="primary", key="btn_todos"
+                ):
                     tot_in = tot_out = 0
                     consolidados = []
                     for fam, txt in prompts.items():
