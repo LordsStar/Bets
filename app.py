@@ -1,25 +1,56 @@
+"""
+Analista de Apuesta Única — v3.5
+
+Requisitos nuevos respecto a v3.4 (agregar a requirements.txt):
+    pandas
+    beautifulsoup4
+
+Cambios v3.4 -> v3.5:
+  [A1] Fix FanGraphs: el prompt ahora exige URL con fecha explícita
+       (fangraphs.com/scores?date=YYYY-MM-DD) — la URL sin fecha puede
+       devolver contenido cacheado de otro día sin aviso.
+  [A2] Fútbol: se elimina "538 SPI" del Model Registry (fuente
+       descontinuada permanentemente desde 2023). ClubElo se mantiene
+       como fuente primaria pero ahora el BACKEND intenta resolverlo
+       directamente vía la API CSV real (api.clubelo.com/Fixtures, no
+       clubelo.com que bloquea bots) antes de pedirle a la IA que
+       busque — igual que ya se hacía con el motor Elo interno para
+       KBO/NPB/MMA. Si ClubElo no cubre el partido, cae a Forebet como
+       respaldo documentado (sin metodología pública verificable, se
+       marca explícitamente). Si ambos fallan, el evento sigue el flujo
+       normal de "externa_directa" y la IA busca por su cuenta.
+  [B3] Sidebar de consumo de APIs con indicadores de color y umbrales
+       de alerta para las tres APIs (Odds, Claude, Gemini).
+"""
+
 import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 
+import pandas as pd
 import requests
 import streamlit as st
 
 # ==============================================================================
-# 1. SYSTEM PROMPT V3.4 — BLINDADO
+# 1. SYSTEM PROMPT V3.5 — BLINDADO
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
 #    relativo, Model Registry obligatorio, motor Elo interno calibrado como
 #    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
-#    tabla de transparencia de descartes (v3.3), y ahora (v3.4):
-#      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
-#      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
-#        registry) para cuando la fuente primaria no expone un número público.
-#      - Sección de salida "CASI CALIFICÓ" con los eventos más cercanos al
-#        umbral que no pasaron.
+#    tabla de transparencia de descartes (v3.3), chequeo de lesión/estado
+#    físico para tenis/boxeo/MMA (v3.4), fuente de respaldo documentada
+#    (v3.4), y ahora (v3.5):
+#      - [A1] Fix obligatorio de URL con fecha para FanGraphs.
+#      - [A2] Fix obligatorio de dominio API para ClubElo + nota de Forebet
+#        como respaldo sin metodología pública verificable + prohibición
+#        explícita de citar "538 SPI" (fuente descontinuada).
+#      - Nueva cobertura "modelo_externo_backend": el backend ya resolvió
+#        el segundo modelo de fútbol vía ClubElo/Forebet antes de que la IA
+#        tenga que buscar nada.
 # ==============================================================================
-SYSTEM_PROMPT_BLINDADO_V3_2 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.4)
+SYSTEM_PROMPT_BLINDADO_V3_5 = """
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.5)
 
 ROL Y OBJETIVO:
 Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
@@ -52,14 +83,46 @@ METODOLOGÍA Y REGLAS CLAVE:
      (o `fuente_secundaria` si la primaria falla) ANTES de concluir que no se
      puede verificar. Prohibido responder "no se puede confirmar" sin haber
      intentado la búsqueda.
-     - RESPALDO DOCUMENTADO (nuevo en v3.4): si ni `fuente_primaria` ni
-       `fuente_secundaria` exponen un número públicamente accesible tras un
-       intento real de búsqueda, revisa si el evento trae un campo
-       `fuente_respaldo` en el registry. Si existe, puedes usarlo — pero
-       cítalo EXPLÍCITAMENTE como respaldo, nunca como si fuera la fuente
-       primaria. Ejemplo correcto: "Fuente: ESPN Analytics — Matchup
-       Predictor (respaldo documentado; FanGraphs no expuso un número
-       público tras la búsqueda)".
+
+     >>> [A1] FIX OBLIGATORIO PARA FanGraphs (fuente primaria de béisbol) <<<
+     Cuando `fuente_primaria` = "FanGraphs", la consulta DEBE hacerse con
+     fecha explícita en la URL:
+         https://www.fangraphs.com/scores?date=YYYY-MM-DD
+     usando la fecha derivada de `inicio_utc` del evento. NUNCA uses la URL
+     sin el parámetro de fecha (fangraphs.com/scores a secas) — esa variante
+     puede devolver contenido cacheado de un día distinto sin ningún aviso
+     visible. Si tras aplicar la fecha correcta los equipos/horarios del
+     resultado NO coinciden con el partido esperado, trata el intento como
+     fallido y sigue el flujo normal de "fuente primaria inaccesible".
+
+     >>> [A2] FIX OBLIGATORIO PARA ClubElo (fuente primaria de fútbol) <<<
+     Si un evento de fútbol llega con `cobertura` = "externa_directa" (es
+     decir, el backend NO logró resolverlo por su cuenta — ver
+     "modelo_externo_backend" más abajo), y necesitas buscar ClubElo tú
+     mismo, la consulta DEBE hacerse contra el subdominio API, nunca contra
+     el sitio web:
+         http://api.clubelo.com/Fixtures   (próximos partidos)
+         http://api.clubelo.com/YYYY-MM-DD (ranking Elo de un día)
+     El dominio clubelo.com (sin "api.") bloquea el acceso automatizado.
+
+     - RESPALDO DOCUMENTADO: si ni `fuente_primaria` ni `fuente_secundaria`
+       exponen un número públicamente accesible tras un intento real de
+       búsqueda, revisa si el evento trae un campo `fuente_respaldo` en el
+       registry. Si existe, puedes usarlo — pero cítalo EXPLÍCITAMENTE como
+       respaldo, nunca como si fuera la fuente primaria. Ejemplo correcto:
+       "Fuente: ESPN Analytics — Matchup Predictor (respaldo documentado;
+       FanGraphs no expuso un número público tras la búsqueda)".
+
+       >>> [A2] NOTA ESPECÍFICA PARA Forebet (respaldo de fútbol) <<<
+       Forebet no publica su metodología, variables de entrada ni backtests
+       verificables (es una caja negra algorítmica). Al citarlo como
+       fuente_respaldo, la nota debe declarar explícitamente esta
+       limitación, por ejemplo: "Fuente: Forebet (respaldo documentado, sin
+       metodología pública verificable; ClubElo no expuso un número
+       accesible tras la búsqueda)". Esto debe pesar a la baja en el
+       desglose de Confianza (regla 6, componente "calidad/frescura de la
+       fuente").
+
      - Si NO hay `fuente_respaldo` documentada y ninguna de las fuentes
        oficiales dio un número verificable, el evento se descarta en la
        categoría 2 (segundo modelo no disponible), con nota "fuente primaria
@@ -75,6 +138,18 @@ METODOLOGÍA Y REGLAS CLAVE:
      "Modelo Elo interno (backend), calibrado con {muestras_brier} resultados
      reales, Brier histórico {brier_score_historico}".
 
+   - "modelo_externo_backend" (nuevo en v3.5, fútbol): el backend YA resolvió
+     este evento consultando directamente ClubElo (api.clubelo.com/Fixtures)
+     o, si ClubElo no cubría el partido, Forebet como respaldo — NO hace
+     falta que hagas una búsqueda web adicional para el segundo modelo de
+     este evento. Usa directamente los campos `probabilidad_home`,
+     `probabilidad_draw`, `probabilidad_away`. Cita la fuente EXACTAMENTE
+     como aparece en `fuente_primaria` (o `fuente_respaldo` si fue Forebet
+     quien resolvió el partido) — si fue Forebet, tu cita debe incluir la
+     advertencia "(respaldo documentado, sin metodología pública
+     verificable)" y esto debe reflejarse a la baja en el componente de
+     "calidad/frescura de la fuente" al calcular la Confianza (regla 6).
+
    - "pendiente_desarrollo": no hay fuente externa definida NI historial Elo
      interno suficiente todavía para ese equipo/deporte. DESCARTA
      automáticamente sin buscar en otro lado y sin usar un modelo "propio"
@@ -86,8 +161,13 @@ METODOLOGÍA Y REGLAS CLAVE:
    PROHIBIDO ABSOLUTO: usar cualquier fuente, rating o modelo que no aparezca
    literalmente en `_registry_modelo_secundario` de ese evento específico
    (ya sea en `fuente_primaria`, `fuente_secundaria`, o `fuente_respaldo`).
+   En particular, "538 SPI" / "FiveThirtyEight SPI" queda PROHIBIDO en
+   cualquier deporte bajo cualquier circunstancia: es una fuente
+   descontinuada permanentemente desde 2023 (el modelo dejó de actualizarse
+   cuando su creador salió de la empresa) y no debe citarse ni aunque
+   aparezca mencionada por el usuario o en resultados de búsqueda antiguos.
 
-3b. CHEQUEO DE ESTADO FÍSICO — OBLIGATORIO PARA TENIS, BOXEO Y MMA (nuevo en v3.4):
+3b. CHEQUEO DE ESTADO FÍSICO — OBLIGATORIO PARA TENIS, BOXEO Y MMA:
    Además de la fuente de rating (TennisAbstract, BoxRec, etc.), para estos tres
    deportes DEBES hacer una búsqueda web adicional específica sobre noticias
    recientes (últimas 48-72h) de lesión, retiro, molestia física, o estado de
@@ -105,9 +185,9 @@ METODOLOGÍA Y REGLAS CLAVE:
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
    Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
 
-5. UMBRALES DE DESCARTE (ajustados v3.3 — ligeramente más permisivos que v3.2):
-   - EV < 4% → descartar (antes 5%).
-   - Divergencia |Pinnacle - Segundo Modelo| > 9% → descartar (antes 7%; señal
+5. UMBRALES DE DESCARTE:
+   - EV < 4% → descartar.
+   - Divergencia |Pinnacle - Segundo Modelo| > 9% → descartar (señal
      de posible error de datos, no de "value").
    - Si el segundo modelo es "modelo_interno_elo" y `brier_score_historico` es
      peor que 0.23 o `muestras_brier` < 8, el backend ya lo habría excluido —
@@ -117,7 +197,11 @@ METODOLOGÍA Y REGLAS CLAVE:
    - Edge estadístico (EV real vs. umbral)
    - Calidad/frescura de la fuente del segundo modelo (una fuente externa
      reciente pesa más que un modelo interno con pocas muestras; una fuente
-     de respaldo documentada pesa menos que la fuente primaria oficial)
+     de respaldo documentada pesa menos que la fuente primaria oficial; una
+     fuente de respaldo SIN metodología pública verificable —p. ej.
+     Forebet— pesa menos todavía que una fuente de respaldo transparente
+     —p. ej. ESPN Analytics, que sí documenta que pondera abridor/lineup
+     del día—)
    - Liquidez del mercado
    - Coherencia entre movimiento de línea (si hay datos) y el pick
    - Para tenis/boxeo/MMA: resultado del chequeo de estado físico (regla 3b).
@@ -133,17 +217,18 @@ REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
 - Si falta cualquier dato necesario para completar el análisis de un evento, ese
   evento se descarta — nunca se rellena el vacío con una suposición "razonable".
 - Cada afirmación estadística debe llevar su fuente (nombre + URL, "Modelo Elo
-  interno" con sus métricas si aplica, o la fuente de respaldo citada como tal).
+  interno" con sus métricas si aplica, o la fuente de respaldo citada como tal,
+  incluyendo la advertencia de caja negra cuando corresponda).
 - Si un evento se descartó en la categoría 1, 2 o 3 (frescura, pendiente_desarrollo
   /fuente inaccesible sin respaldo, o liquidez), NUNCA calcules ni inventes un EV%
   o divergencia% para él — en esos casos ni siquiera se llegó a evaluar el segundo
   modelo. Repórtalo como "N/A — no se calculó" en la tabla de la sección 4.
 - El campo `fuente_respaldo` NUNCA se usa por comodidad o para ahorrar una
   búsqueda — solo se usa después de haber intentado realmente la fuente primaria
-  y, si aplica, la secundaria, y haber confirmado que ninguna expone un número
-  público.
+  (con la URL correcta según las notas A1/A2 de arriba) y, si aplica, la
+  secundaria, y haber confirmado que ninguna expone un número público.
 
-CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (v3.3, ajustada en v3.4):
+CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE:
 Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
 de prioridad (aplica la primera que corresponda y detente ahí, no evalúes las
 siguientes para ese evento):
@@ -155,7 +240,8 @@ siguientes para ese evento):
    4º EV por debajo del umbral (regla 5)
    5º Divergencia por encima del umbral (regla 5)
    6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
-      (incluye el caso de una señal de estado físico no cuantificable, regla 3b)
+      (incluye el caso de una señal de estado físico no cuantificable, regla 3b,
+      y el caso de respaldo sin metodología pública verificable)
 Un evento NUNCA debe contarse en dos categorías a la vez.
 
 AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
@@ -189,13 +275,14 @@ FORMATO DE SALIDA (obligatorio, en español):
      descartado en 4 o 5, escribe "N/A — descartado antes de este cálculo").
    - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
      "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
-     6/10 — fuente externa reciente pero noticia de lesión no cuantificable").
-5. CASI CALIFICÓ (nuevo en v3.4): de los eventos en categorías 4, 5 y 6 que SÍ
-   tuvieron datos reales calculados (no los marcados "N/A — no se pudo
-   verificar"), identifica los 1-3 que estuvieron más cerca de pasar TODOS los
-   umbrales — por ejemplo, divergencia apenas sobre el 9%, EV apenas debajo del
-   4%, o confianza a 1-2 puntos de 8/10. Preséntalos en una tabla corta,
-   ordenada de más cerca a menos cerca del umbral:
+     6/10 — fuente externa reciente pero noticia de lesión no cuantificable",
+     "Confianza 6/10 — respaldo Forebet sin metodología pública verificable").
+5. CASI CALIFICÓ: de los eventos en categorías 4, 5 y 6 que SÍ tuvieron datos
+   reales calculados (no los marcados "N/A — no se pudo verificar"), identifica
+   los 1-3 que estuvieron más cerca de pasar TODOS los umbrales — por ejemplo,
+   divergencia apenas sobre el 9%, EV apenas debajo del 4%, o confianza a 1-2
+   puntos de 8/10. Preséntalos en una tabla corta, ordenada de más cerca a
+   menos cerca del umbral:
    | Partido | Qué faltó | Qué tan cerca (número exacto vs. umbral) |
    Si ningún evento tiene datos reales suficientes para esta comparación,
    omite la tabla y dilo explícitamente: "No hay eventos con datos suficientes
@@ -207,43 +294,58 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 
+# Umbrales para el sidebar de consumo de APIs (sección 5).
+ODDS_YELLOW_THRESHOLD = 100
+ODDS_RED_THRESHOLD = 20
+CLAUDE_TOKEN_WARNING = 500_000   # tokens acumulados en la SESIÓN, no cuota real del plan
+GEMINI_TOKEN_WARNING = 500_000   # ídem
+
 # ==============================================================================
 # 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
 #     Vive en código (versionado, editable a mano), NO en el prompt.
 #     "cobertura" posibles:
-#       - "externa_directa"      → fuente pública conocida, la IA debe buscarla.
-#       - "pendiente_desarrollo" → sin fuente externa Y sin Elo interno maduro
-#                                  todavía. Se descarta, nunca se improvisa.
-#       - "excluido_estructural" → se excluye antes de llegar a la IA.
+#       - "externa_directa"        → fuente pública conocida, la IA debe
+#                                     buscarla ella misma si el backend no
+#                                     logró resolverla antes.
+#       - "modelo_externo_backend" → (nuevo v3.5) el backend YA resolvió el
+#                                     dato consultando la fuente real
+#                                     directamente (hoy: ClubElo/Forebet
+#                                     para fútbol). Cero búsqueda de IA.
+#       - "pendiente_desarrollo"   → sin fuente externa Y sin Elo interno
+#                                     maduro todavía. Se descarta, nunca se
+#                                     improvisa.
+#       - "excluido_estructural"   → se excluye antes de llegar a la IA.
 #     Los deportes marcados abajo como "usa_elo_interno": True son candidatos a
 #     que el motor Elo interno los resuelva automáticamente cuando acumule
 #     suficiente historial (ver sección 1c).
 #
-#     NUEVO v3.4 — "fuente_respaldo": fuente de respaldo DOCUMENTADA que la IA
-#     puede citar (explícitamente como respaldo, nunca como si fuera la
-#     primaria) SOLO si tanto `fuente_primaria` como `fuente_secundaria` (si
-#     existe) no exponen un número público tras un intento real de búsqueda.
-#     Se agregó para los deportes donde ESPN publica un "Matchup Predictor"
-#     públicamente accesible como alternativa razonable a fuentes que a veces
-#     están detrás de muro de pago o no exponen la probabilidad en texto
-#     buscable (ej. FanGraphs). No se agrega a deportes donde no hay un
-#     respaldo público conocido y confiable (tenis, cricket, boxeo, MMA,
-#     fútbol) — para esos, sin respaldo documentado, el evento va a categoría 2
-#     si la fuente primaria/secundaria no es accesible.
+#     "fuente_respaldo": fuente de respaldo DOCUMENTADA que la IA puede citar
+#     (explícitamente como respaldo, nunca como si fuera la primaria) SOLO si
+#     tanto `fuente_primaria` como `fuente_secundaria` (si existe) no exponen
+#     un número público tras un intento real de búsqueda.
+#
+#     v3.5: se elimina "FiveThirtyEight SPI" del registry de fútbol (fuente
+#     descontinuada permanentemente desde 2023) y se agrega "Forebet" como
+#     fuente_respaldo, con nota explícita de que no tiene metodología pública
+#     verificable. ClubElo se mantiene como fuente_primaria, resuelta ahora
+#     preferentemente por el backend (ver sección 1d) en vez de por la IA.
 # ==============================================================================
-REGISTRY_ULTIMA_REVISION = "2026-08-21"
+REGISTRY_ULTIMA_REVISION = "2026-08-22"
 
 MODEL_REGISTRY = [
     {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
-    {"patron": "soccer", "fuente_primaria": "ClubElo", "fuente_secundaria": "FiveThirtyEight SPI",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer", "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures)",
+     "fuente_secundaria": None,
+     "fuente_respaldo": "Forebet (sin metodología pública verificable)",
+     "cobertura": "externa_directa", "version": "2.0", "usa_elo_interno": False},
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
      "usa_elo_interno": False},
-    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs", "fuente_secundaria": None,
+    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs (usar SIEMPRE ?date=YYYY-MM-DD)",
+     "fuente_secundaria": None,
      "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+     "cobertura": "externa_directa", "version": "1.1", "usa_elo_interno": False},
     {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
     {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
@@ -454,11 +556,199 @@ def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
     }
 
 
+# ==============================================================================
+# 1d. CLUBELO / FOREBET (fútbol) — resolución directa desde el backend
+#     [NUEVO v3.5]
+#
+#     Antes, el registry solo indicaba "busca ClubElo" y la IA tenía que
+#     buscarlo por su cuenta en cada corrida (gastando tokens y sujeto a
+#     errores de búsqueda). Ahora el backend intenta resolverlo DIRECTO,
+#     igual que ya hace con el motor Elo interno para KBO/NPB/MMA:
+#
+#     1. Intenta ClubElo vía la API CSV real: http://api.clubelo.com/Fixtures
+#        (NO clubelo.com, que bloquea acceso automatizado).
+#     2. Si ClubElo no cubre el partido o el servicio está caído (se ha visto
+#        "Site overloaded" en el pasado), cae a Forebet como respaldo
+#        documentado — sin metodología pública verificable, se marca así
+#        explícitamente para que la IA lo refleje en su cálculo de Confianza.
+#     3. Si ninguno resuelve el partido, se devuelve None y el evento sigue
+#        el flujo normal de "externa_directa": la IA busca por su cuenta,
+#        con las URLs correctas indicadas en el prompt (sección A2).
+# ==============================================================================
+
+CLUBELO_API_BASE = "http://api.clubelo.com"
+FOREBET_URL = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_fixtures_clubelo():
+    """Descarga /Fixtures de ClubElo (probabilidades pre-calculadas para
+    todos los próximos partidos). Cacheado 1h. Devuelve None si el
+    servicio está inaccesible."""
+    try:
+        r = requests.get(f"{CLUBELO_API_BASE}/Fixtures", timeout=10)
+        r.raise_for_status()
+        texto = r.text.strip()
+        if not texto or texto.lower().startswith("site overloaded"):
+            return None
+        df = pd.read_csv(StringIO(r.text))
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _es_diferencia_positiva(nombre_columna):
+    try:
+        return int(nombre_columna) > 0
+    except ValueError:
+        return False
+
+
+def _es_diferencia_negativa(nombre_columna):
+    try:
+        return int(nombre_columna) < 0
+    except ValueError:
+        return False
+
+
+def _prob_desde_fixtures_clubelo(df, home_team, away_team):
+    """Busca un partido específico dentro del dataframe de /Fixtures y
+    agrega las columnas de diferencia de gol en Home/Draw/Away.
+
+    NOTA: la agregación asume el esquema de columnas descrito en
+    clubelo.com/API (columnas numéricas de diferencia de gol -5..+5).
+    Verificar contra una corrida real antes de confiar 100% en producción
+    — si el esquema no calza exactamente, esta función simplemente no
+    encuentra el partido (devuelve None) y el flujo cae a Forebet/IA sin
+    romper nada."""
+    if df is None or df.empty:
+        return None
+    try:
+        match = df[
+            (df["Home"].str.strip().str.lower() == home_team.strip().lower())
+            & (df["Away"].str.strip().str.lower() == away_team.strip().lower())
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        cols_gol = [c for c in df.columns if c not in ("Date", "League", "Home", "Away")]
+        prob_home = sum(row[c] for c in cols_gol if _es_diferencia_positiva(c))
+        prob_away = sum(row[c] for c in cols_gol if _es_diferencia_negativa(c))
+        prob_draw = max(0.0, 1.0 - prob_home - prob_away)
+        return {
+            "prob_home": round(float(prob_home), 4),
+            "prob_draw": round(float(prob_draw), 4),
+            "prob_away": round(float(prob_away), 4),
+        }
+    except Exception:
+        return None
+
+
+def obtener_prediccion_forebet(home_team, away_team):
+    """Respaldo cuando ClubElo no está disponible o no cubre el partido.
+    Forebet no tiene API oficial -> scraping liviano, inherentemente frágil
+    (puede romperse si Forebet cambia su HTML; requiere `beautifulsoup4`).
+    Se marca explícitamente como fuente sin metodología pública verificable.
+
+    NOTA: los selectores CSS (".rcnt", etc.) son de ejemplo — inspecciona
+    el HTML real de Forebet y ajústalos antes de confiar en esto en
+    producción. Si falla la extracción, devuelve None sin romper el flujo
+    general (el evento cae a "externa_directa" normal)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    try:
+        r = requests.get(
+            FOREBET_URL, timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BlindadoBot/1.0)"},
+        )
+        r.raise_for_status()
+    except Exception:
+        return None
+
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+        filas = soup.select(".rcnt")  # selector de ejemplo — ajustar contra HTML real
+        for fila in filas:
+            texto_fila = fila.get_text(" ", strip=True).lower()
+            if home_team.lower() in texto_fila and away_team.lower() in texto_fila:
+                prob_home_el = fila.select_one(".prc_1")
+                prob_draw_el = fila.select_one(".prc_X")
+                prob_away_el = fila.select_one(".prc_2")
+                if not (prob_home_el and prob_draw_el and prob_away_el):
+                    return None
+                return {
+                    "prob_home": round(float(prob_home_el.get_text(strip=True).replace("%", "")) / 100, 4),
+                    "prob_draw": round(float(prob_draw_el.get_text(strip=True).replace("%", "")) / 100, 4),
+                    "prob_away": round(float(prob_away_el.get_text(strip=True).replace("%", "")) / 100, 4),
+                }
+    except Exception:
+        return None
+
+    return None
+
+
+def obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team):
+    """Intenta resolver el segundo modelo de un evento de fútbol
+    DIRECTAMENTE desde el backend (sin gastar tokens de IA), en este orden:
+    1. ClubElo API (fuente primaria real, vía api.clubelo.com)
+    2. Forebet (respaldo documentado, sin metodología pública verificable)
+    Si ninguno resuelve el partido, devuelve None y el evento sigue el
+    flujo normal de 'externa_directa' (la IA hace la búsqueda web ella
+    misma, como en versiones anteriores)."""
+    if not sport_key or not sport_key.startswith("soccer") or not home_team or not away_team:
+        return None
+
+    fixtures = obtener_fixtures_clubelo()
+    resultado_clubelo = _prob_desde_fixtures_clubelo(fixtures, home_team, away_team)
+    if resultado_clubelo:
+        return {
+            "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures) — resuelto directo por backend",
+            "fuente_secundaria": None,
+            "fuente_respaldo": "Forebet (sin metodología pública verificable)",
+            "cobertura": "modelo_externo_backend",
+            "version": "1.0",
+            "ultima_revision": REGISTRY_ULTIMA_REVISION,
+            "probabilidad_home": resultado_clubelo["prob_home"],
+            "probabilidad_draw": resultado_clubelo["prob_draw"],
+            "probabilidad_away": resultado_clubelo["prob_away"],
+        }
+
+    resultado_forebet = obtener_prediccion_forebet(home_team, away_team)
+    if resultado_forebet:
+        return {
+            "fuente_primaria": "ClubElo (api.clubelo.com/Fixtures) — sin dato para este partido",
+            "fuente_secundaria": None,
+            "fuente_respaldo": (
+                "Forebet (respaldo documentado, sin metodología pública verificable) "
+                "— resuelto directo por backend"
+            ),
+            "cobertura": "modelo_externo_backend",
+            "version": "1.0",
+            "ultima_revision": REGISTRY_ULTIMA_REVISION,
+            "probabilidad_home": resultado_forebet["prob_home"],
+            "probabilidad_draw": resultado_forebet["prob_draw"],
+            "probabilidad_away": resultado_forebet["prob_away"],
+            "metodologia_publica_respaldo": False,
+        }
+
+    return None
+
+
 def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
-    """Punto único de verdad para el segundo modelo de un evento: primero mira
-    el registry estático; si ese deporte está marcado para usar Elo interno y
-    hay suficiente calidad, lo reemplaza por la entrada calculada."""
+    """Punto único de verdad para el segundo modelo de un evento:
+    1. Fútbol: intenta resolución directa vía ClubElo/Forebet (backend).
+    2. Deportes con motor Elo interno marcado y calidad suficiente: usa Elo interno.
+    3. Si nada de lo anterior aplica: devuelve la entrada estática del registry
+       (la IA deberá buscar por su cuenta si la cobertura es 'externa_directa')."""
     base = _buscar_base_registry(sport_key)
+
+    if sport_key and sport_key.startswith("soccer") and home_team and away_team:
+        resuelto_backend = obtener_entrada_clubelo_o_forebet(sport_key, home_team, away_team)
+        if resuelto_backend:
+            return resuelto_backend
 
     if (
         base.get("usa_elo_interno")
@@ -624,6 +914,7 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
     descartados_sin_fecha = 0
     descartados_exclusion_estructural = 0
     eventos_con_elo_interno = 0
+    eventos_con_backend_directo = 0
     eventos_pendientes_desarrollo = 0
 
     ahora_utc = datetime.now(timezone.utc)
@@ -686,6 +977,8 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
 
         if registry_entry["cobertura"] == "modelo_interno_elo":
             eventos_con_elo_interno += 1
+        elif registry_entry["cobertura"] == "modelo_externo_backend":
+            eventos_con_backend_directo += 1
         elif registry_entry["cobertura"] == "pendiente_desarrollo":
             eventos_pendientes_desarrollo += 1
 
@@ -714,14 +1007,15 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
         f"{descartados_fuera_de_rango} descartados fuera de rango de cuota, "
         f"{descartados_exclusion_estructural} excluidos estructuralmente (preseason/exhibición). "
         f"De los {len(eventos_validos)} candidatos: {eventos_con_elo_interno} resueltos por el motor "
-        f"Elo interno (calibrado) y {eventos_pendientes_desarrollo} siguen sin segundo modelo "
+        f"Elo interno, {eventos_con_backend_directo} resueltos directo por el backend "
+        f"(ClubElo/Forebet, fútbol) y {eventos_pendientes_desarrollo} siguen sin segundo modelo "
         f"disponible (la IA los descartará)."
     )
     return eventos_validos, resumen_filtro
 
 
 # ==============================================================================
-# 2b. MODO "POR DEPORTE" (nuevo en v3.5)
+# 2b. MODO "POR DEPORTE"
 #
 #     PROBLEMA QUE RESUELVE: con "TODOS LOS DEPORTES ACTIVOS" en un solo
 #     prompt, el presupuesto de búsqueda de la IA se reparte entre 30-40+
@@ -736,6 +1030,9 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
 #     "excluido_estructural" NUNCA necesitan que la IA busque nada — el
 #     resultado ya es 100% determinístico. Este modo los separa y genera su
 #     resumen directamente en código, con CERO tokens de IA gastados en ellos.
+#     Lo mismo aplica ahora (v3.5) a los eventos "modelo_externo_backend": el
+#     backend ya trae el número, la IA solo tiene que citarlo y calcular
+#     EV/divergencia/confianza — no necesita gastar una búsqueda web en ellos.
 # ==============================================================================
 
 def familia_deporte(sport_key):
@@ -758,10 +1055,11 @@ def agrupar_eventos_por_familia(eventos):
 
 def separar_ia_vs_automatico(eventos_familia):
     """Divide los eventos de una familia entre los que SÍ necesitan que la IA
-    busque y analice ('externa_directa', 'modelo_interno_elo') y los que ya
-    son descarte 100% determinístico por reglas del backend
-    ('pendiente_desarrollo', 'excluido_estructural'). Estos últimos NUNCA
-    necesitan gastar tokens de IA — el resultado ya se sabe de antemano."""
+    busque y analice ('externa_directa', 'modelo_interno_elo',
+    'modelo_externo_backend') y los que ya son descarte 100% determinístico
+    por reglas del backend ('pendiente_desarrollo', 'excluido_estructural').
+    Estos últimos NUNCA necesitan gastar tokens de IA — el resultado ya se
+    sabe de antemano."""
     necesita_ia, automaticos = [], []
     for ev in eventos_familia:
         cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
@@ -790,10 +1088,10 @@ def resumen_automatico_grupo(familia, eventos_automaticos):
 
 def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
     """Arma un prompt scoped a UNA familia de deporte, reutilizando el mismo
-    SYSTEM_PROMPT_BLINDADO_V3_2 (reglas idénticas), pero con el JSON limitado
+    SYSTEM_PROMPT_BLINDADO_V3_5 (reglas idénticas), pero con el JSON limitado
     a los eventos de esa familia que sí necesitan verificación de IA."""
     return (
-        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+        f"{SYSTEM_PROMPT_BLINDADO_V3_5}\n\n"
         f"==================================================\n"
         f"CONTEXTO DE EJECUCIÓN DEL BACKEND (MODO POR DEPORTE)\n"
         f"==================================================\n"
@@ -804,16 +1102,19 @@ def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, sec
         f"{seccion_movimiento}\n\n"
         f"NOTA IMPORTANTE: Este prompt contiene ÚNICAMENTE los eventos de la "
         f"familia '{familia}' que ya pasaron el pre-filtrado de frescura y "
-        f"liquidez y tienen cobertura 'externa_directa' o 'modelo_interno_elo'. "
-        f"Los eventos de esta misma familia con cobertura 'pendiente_desarrollo' "
-        f"o 'excluido_estructural' YA fueron descartados por el backend sin "
-        f"usar IA (ver resumen aparte) — no vienen en este JSON, y por lo "
-        f"tanto NO deben aparecer en tu conteo de categoría 2 de este prompt "
-        f"(ese conteo se reporta aparte, fuera de la IA).\n\n"
+        f"liquidez y tienen cobertura 'externa_directa', 'modelo_interno_elo' "
+        f"o 'modelo_externo_backend'. Los eventos de esta misma familia con "
+        f"cobertura 'pendiente_desarrollo' o 'excluido_estructural' YA fueron "
+        f"descartados por el backend sin usar IA (ver resumen aparte) — no "
+        f"vienen en este JSON, y por lo tanto NO deben aparecer en tu conteo "
+        f"de categoría 2 de este prompt (ese conteo se reporta aparte, fuera "
+        f"de la IA).\n\n"
         f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
         f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
         f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
-        f"de-vig ni filtres por rango nuevamente.\n\n"
+        f"de-vig ni filtres por rango nuevamente. Para eventos con cobertura "
+        f"'modelo_externo_backend', usa directamente `probabilidad_home` / "
+        f"`probabilidad_draw` / `probabilidad_away` sin buscar en la web.\n\n"
         f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS (solo familia '{familia}'):\n"
         f"{json.dumps(eventos_grupo, indent=2, ensure_ascii=False)}"
     )
@@ -916,12 +1217,6 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
     - ratelimit: headers 'anthropic-ratelimit-*' — son ventanas de tasa
       (requests/tokens por minuto), NO el saldo en dólares de la cuenta. El
       saldo prepagado solo se ve en console.anthropic.com → Billing.
-
-    NOTA v3.3/v3.4: con la tabla de transparencia y la sección "casi calificó"
-    activadas, esta llamada puede necesitar bastantes tokens de salida —
-    default subido a 8000. Si notas respuestas cortadas en corridas con
-    "TODOS LOS DEPORTES ACTIVOS" (muchos eventos externa_directa), considera
-    correr por deporte individual en vez de todos a la vez.
     """
     url = f"{ANTHROPIC_API_BASE}/messages"
     headers = {
@@ -963,7 +1258,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno & Modo por Deporte)")
+st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno, ClubElo Directo & Modo por Deporte)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
@@ -979,31 +1274,65 @@ with st.sidebar:
     if not anthropic_api_key:
         anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
 
+    # --- 5. Sidebar de consumo de APIs (con indicadores de color y alertas) ---
+    st.divider()
+    st.subheader("📊 Consumo de APIs")
+
+    # The Odds API: sí tiene un "restante" real vía headers.
     if "odds_api_uso" in st.session_state:
         uso = st.session_state["odds_api_uso"]
-        st.caption(f"📉 Odds API — usados: {uso['usados']} · restantes: {uso['restantes']}")
+        try:
+            restantes = int(uso["restantes"])
+            if restantes > ODDS_YELLOW_THRESHOLD:
+                icono = "🟢"
+            elif restantes > ODDS_RED_THRESHOLD:
+                icono = "🟡"
+            else:
+                icono = "🔴"
+            st.metric(f"{icono} The Odds API — restantes", restantes)
+            if restantes <= ODDS_RED_THRESHOLD:
+                st.warning("⚠️ Quedan pocas requests en The Odds API. Considera rotar la key.")
+        except (TypeError, ValueError, KeyError):
+            st.caption("The Odds API: header de consumo no legible")
+    else:
+        st.caption("The Odds API: sin llamadas registradas aún")
 
-    if "gemini_tokens_acumulados" in st.session_state:
-        g = st.session_state["gemini_tokens_acumulados"]
-        st.caption(
-            f"🧮 Gemini (sesión) — prompt: {g['prompt']:,} · salida: {g['salida']:,} · "
-            f"total: {g['total']:,} tokens"
-        )
-        st.caption("Saldo/crédito real: solo visible en Google AI Studio / Cloud Console.")
-
+    # Claude y Gemini: NO exponen cuota real restante vía API — solo tokens
+    # acumulados en esta sesión del navegador. El saldo/crédito real
+    # siempre hay que revisarlo en el dashboard de facturación de cada
+    # proveedor (console.anthropic.com / Google AI Studio).
     if "claude_tokens_acumulados" in st.session_state:
         c = st.session_state["claude_tokens_acumulados"]
-        st.caption(
-            f"🧮 Claude (sesión) — entrada: {c['entrada']:,} · salida: {c['salida']:,} · "
-            f"total: {c['total']:,} tokens"
-        )
+        st.metric("Claude — tokens entrada (sesión)", f"{c['entrada']:,}")
+        st.metric("Claude — tokens salida (sesión)", f"{c['salida']:,}")
+        if c["total"] >= CLAUDE_TOKEN_WARNING:
+            st.warning(
+                f"⚠️ Consumo de Claude en esta sesión superó {CLAUDE_TOKEN_WARNING:,} tokens. "
+                "Revisa tu dashboard de facturación de Anthropic."
+            )
         if "claude_ratelimit" in st.session_state:
             rl = st.session_state["claude_ratelimit"]
             st.caption(
                 f"⏱️ Ventana de rate-limit — tokens restantes: {rl['tokens_restantes']}/"
                 f"{rl['tokens_limite']} · requests restantes: {rl['requests_restantes']}"
             )
-        st.caption("Saldo/crédito prepagado real: solo visible en console.anthropic.com → Billing.")
+
+    if "gemini_tokens_acumulados" in st.session_state:
+        g = st.session_state["gemini_tokens_acumulados"]
+        st.metric("Gemini — tokens totales (sesión)", f"{g['total']:,}")
+        st.caption(f"Entrada: {g['prompt']:,} · Salida: {g['salida']:,}")
+        if g["total"] >= GEMINI_TOKEN_WARNING:
+            st.warning(
+                f"⚠️ Consumo de Gemini en esta sesión superó {GEMINI_TOKEN_WARNING:,} tokens. "
+                "Revisa tu dashboard de facturación de Google."
+            )
+
+    if "claude_tokens_acumulados" in st.session_state or "gemini_tokens_acumulados" in st.session_state:
+        st.caption(
+            "Nota: Claude y Gemini no exponen cuota 'restante' real vía API. "
+            "Estos números son el consumo acumulado de esta sesión, no tu "
+            "límite total del plan."
+        )
 
     estado_elo_sidebar = cargar_estado_elo()
     if estado_elo_sidebar.get("ratings"):
@@ -1034,12 +1363,13 @@ if api_key:
                 "presupuesto de búsqueda antes de verificar todos — algunos con valor real pueden quedar "
                 "sin analizar. 'Separado por deporte' cuesta más tokens en total pero garantiza que cada "
                 "evento reciba una búsqueda real, y no gasta tokens de IA en eventos ya descartables "
-                "automáticamente (CFL, AFL, NRL, KBO, NPB sin historial, etc.)."
+                "automáticamente (CFL, AFL, NRL, KBO, NPB sin historial, etc.) ni en eventos de fútbol "
+                "que el backend ya resolvió directo vía ClubElo/Forebet."
             ),
         )
 
         if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
-            with st.spinner("Consultando The Odds API, actualizando motor Elo y procesando pre-filtros..."):
+            with st.spinner("Consultando The Odds API, ClubElo, actualizando motor Elo y procesando pre-filtros..."):
                 datos_acumulados = []
 
                 if deporte_key_seleccionado == "ALL":
@@ -1085,7 +1415,7 @@ if api_key:
                     st.session_state.pop("prompts_por_grupo", None)
                     st.session_state.pop("resumen_automatico_grupo", None)
                     prompt_completo = (
-                        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+                        f"{SYSTEM_PROMPT_BLINDADO_V3_5}\n\n"
                         f"==================================================\n"
                         f"CONTEXTO DE EJECUCIÓN DEL BACKEND\n"
                         f"==================================================\n"
@@ -1096,7 +1426,9 @@ if api_key:
                         f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
                         f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
                         f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
-                        f"de-vig ni filtres por rango nuevamente.\n\n"
+                        f"de-vig ni filtres por rango nuevamente. Para eventos con cobertura "
+                        f"'modelo_externo_backend', usa directamente `probabilidad_home` / "
+                        f"`probabilidad_draw` / `probabilidad_away` sin buscar en la web.\n\n"
                         f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS:\n"
                         f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
                     )
@@ -1187,8 +1519,10 @@ if api_key:
             st.subheader("⚡ Ejecución Directa en App (Claude API — búsqueda forzada)")
             st.caption(
                 "Esta llamada incluye el tool `web_search` directamente en el request, "
-                "así que Claude SÍ puede buscar en ClubElo/FanGraphs/TennisAbstract "
-                "aunque el toggle de búsqueda en claude.ai estuviera apagado."
+                "así que Claude SÍ puede buscar en FanGraphs/TennisAbstract/etc. aunque "
+                "el toggle de búsqueda en claude.ai estuviera apagado. Para fútbol, la "
+                "mayoría de los eventos ya vienen resueltos por el backend (ClubElo/Forebet) "
+                "y no requieren que Claude busque nada."
             )
 
             modelos_claude = listar_modelos_claude(anthropic_api_key)
@@ -1217,8 +1551,9 @@ if api_key:
                             else:
                                 st.warning(
                                     "⚠️ Claude no ejecutó ninguna búsqueda web en esta corrida — "
-                                    "revisa el resultado, es posible que haya descartado todo por "
-                                    "falta de datos verificables en vez de fabricarlos."
+                                    "revisa el resultado: puede ser porque todos los eventos venían "
+                                    "resueltos directo por el backend (Elo interno/ClubElo/Forebet), "
+                                    "o porque descartó todo por falta de datos verificables."
                                 )
 
                             entrada_tok = uso_tokens.get("input_tokens", 0) or 0
@@ -1290,6 +1625,14 @@ if api_key:
                                     f"{familia.upper()}: {entrada_tok:,} tokens de entrada · "
                                     f"{salida_tok:,} de salida."
                                 )
+
+                                prev = st.session_state.get(
+                                    "claude_tokens_acumulados", {"entrada": 0, "salida": 0, "total": 0}
+                                )
+                                prev["entrada"] += entrada_tok
+                                prev["salida"] += salida_tok
+                                prev["total"] += entrada_tok + salida_tok
+                                st.session_state["claude_tokens_acumulados"] = prev
                             except Exception as e:
                                 st.error(f"Error al analizar {familia.upper()}: {e}")
                     st.divider()
