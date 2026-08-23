@@ -6,6 +6,16 @@ from datetime import datetime, timedelta, timezone
 import requests
 import streamlit as st
 
+# soccerdata es OPCIONAL: si no está instalado (pip install soccerdata), el
+# backend simplemente no intenta resolver ClubElo por su cuenta y soccer cae
+# directo a fuente_primaria = elofootball.com para que la IA lo busque (ver
+# sección 1d más abajo).
+try:
+    import soccerdata as sd
+    _SOCCERDATA_DISPONIBLE = True
+except ImportError:
+    _SOCCERDATA_DISPONIBLE = False
+
 # ==============================================================================
 # 1. SYSTEM PROMPT V3.4 — BLINDADO
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
@@ -230,14 +240,36 @@ ANTHROPIC_VERSION = "2023-06-01"
 #     respaldo público conocido y confiable (tenis, cricket, boxeo, MMA,
 #     fútbol) — para esos, sin respaldo documentado, el evento va a categoría 2
 #     si la fuente primaria/secundaria no es accesible.
+#
+#     ACTUALIZACIÓN v3.4.2 (2026-08-23) — SOCCER: FiveThirtyEight SPI está
+#     confirmado como discontinuado/defunto y ya no es fuente válida. Además,
+#     "soccerdata" es una LIBRERÍA de Python, no un sitio web — no tiene
+#     ningún sentido ponerla en el registry para que la IA la "busque" con su
+#     herramienta de web_search (no hay nada navegable que encontrar). Por
+#     eso el rediseño real es:
+#       - El propio BACKEND resuelve ClubElo directamente con soccerdata
+#         (que internamente pega a api.clubelo.com) ANTES de armar el
+#         prompt — ver sección 1d, `obtener_entrada_clubelo_backend()`. Si
+#         funciona, el evento sale con cobertura "modelo_interno_elo" (cero
+#         tokens de búsqueda, cero riesgo de invención) igual que ya pasa
+#         con el motor Elo interno de KBO/NPB/MMA.
+#       - Esta entrada de registry para "soccer" (fuente_primaria =
+#         elofootball.com) SOLO se usa como respaldo cuando el backend no
+#         pudo resolver el evento (api.clubelo.com caída, o no se encontró
+#         alguno de los dos equipos por nombre) — ahí sí es un sitio web
+#         real, HTML plano, que la IA puede buscar y citar.
+#       - elofootball.com cubre ~55 países europeos. NO cubre Argentina,
+#         Brasil, Chile, México (Liga MX) ni MLS — para esas ligas, si el
+#         backend tampoco resolvió, el evento cae en categoría 2 sin
+#         respaldo adicional (no hay ninguna fuente documentada ahí todavía).
 # ==============================================================================
-REGISTRY_ULTIMA_REVISION = "2026-08-21"
+REGISTRY_ULTIMA_REVISION = "2026-08-23"
 
 MODEL_REGISTRY = [
     {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
-    {"patron": "soccer", "fuente_primaria": "ClubElo", "fuente_secundaria": "FiveThirtyEight SPI",
-     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
      "usa_elo_interno": False},
@@ -460,6 +492,15 @@ def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_e
     hay suficiente calidad, lo reemplaza por la entrada calculada."""
     base = _buscar_base_registry(sport_key)
 
+    # --- NUEVO v3.4.2: soccer intenta resolverse por ClubElo-backend antes
+    # de usar la entrada estática (elofootball.com). Si el backend no pudo
+    # (paquete no instalado, api.clubelo.com caída, o no encontró alguno de
+    # los dos equipos por nombre), sigue de largo con el registry normal. ---
+    if sport_key and sport_key.lower().startswith("soccer") and home_team and away_team:
+        resuelto_por_backend = obtener_entrada_clubelo_backend(home_team, away_team)
+        if resuelto_por_backend:
+            return resuelto_por_backend
+
     if (
         base.get("usa_elo_interno")
         and base["cobertura"] == "pendiente_desarrollo"
@@ -481,6 +522,127 @@ def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_e
 
     base["ultima_revision"] = REGISTRY_ULTIMA_REVISION
     return base
+
+
+# ==============================================================================
+# 1d. MOTOR CLUBELO POR BACKEND (soccerdata) — NUEVO v3.4.2
+#
+#     POR QUÉ EXISTE: la IA solo tiene una herramienta real, `web_search`.
+#     "soccerdata" es una librería Python — pedirle a la IA que la "busque"
+#     como si fuera un sitio web no tiene ningún efecto útil. La solución
+#     correcta es que el propio backend descargue los ratings de ClubElo
+#     (vía soccerdata, que internamente pega a api.clubelo.com) ANTES de
+#     armar el prompt, y calcule la probabilidad de resultado él mismo —
+#     exactamente el mismo patrón que ya usa el motor Elo interno para
+#     KBO/NPB/MMA (sección 1c), solo que aquí el rating no se calcula desde
+#     cero: se DESCARGA de ClubElo.
+#
+#     SI FALLA (api.clubelo.com no responde desde tu servidor, o no se
+#     encuentra alguno de los dos equipos por nombre tras el match exacto +
+#     fuzzy): esta función devuelve None, y `obtener_entrada_registry()` cae
+#     de vuelta a la entrada estática del registry para "soccer"
+#     (fuente_primaria = elofootball.com), que sí es un sitio navegable para
+#     que la IA lo busque por su cuenta.
+#
+#     REQUISITO: pip install soccerdata (y sus dependencias: pandas, etc.).
+#     Si el paquete no está instalado, `_SOCCERDATA_DISPONIBLE` queda en
+#     False y esta sección se salta por completo sin romper nada más.
+# ==============================================================================
+
+CLUBELO_VENTAJA_LOCAL = 60.0  # ventaja de local aprox. en puntos Elo (documentada por ClubElo)
+CLUBELO_CACHE_TTL_SEGUNDOS = 6 * 3600  # ClubElo recalcula por jornada, no por minuto
+CLUBELO_JACCARD_MINIMO = 0.5  # umbral mínimo de similitud para aceptar un match fuzzy de nombre
+
+
+@st.cache_data(ttl=CLUBELO_CACHE_TTL_SEGUNDOS, show_spinner=False)
+def _descargar_ranking_clubelo(fecha_iso):
+    """Descarga el ranking ClubElo completo para una fecha (YYYY-MM-DD) usando
+    soccerdata. Devuelve un DataFrame de pandas, o None si el paquete no está
+    instalado o la descarga falla (red, api.clubelo.com caída, etc.).
+    Cacheado varias horas: ClubElo no recalcula en tiempo real, solo tras
+    cada jornada jugada."""
+    if not _SOCCERDATA_DISPONIBLE:
+        return None
+    try:
+        elo = sd.ClubElo()
+        return elo.read_by_date(fecha_iso)
+    except Exception:
+        return None
+
+
+def _buscar_elo_equipo(df_ranking, nombre_equipo):
+    """Busca un equipo en el ranking de ClubElo. Primero intenta match exacto
+    (case-insensitive); si no hay, cae a fuzzy por Jaccard de tokens — mismo
+    enfoque que ya usa el resto de Blindado para nombres de equipo que no
+    coinciden letra por letra entre The Odds API y la fuente externa (ej.
+    acentos, sufijos de ciudad, abreviaciones)."""
+    if df_ranking is None or getattr(df_ranking, "empty", True) or not nombre_equipo:
+        return None
+
+    columnas = list(df_ranking.columns)
+    columna_club = "team" if "team" in columnas else "Club" if "Club" in columnas else columnas[0]
+    columna_elo = "elo" if "elo" in columnas else "Elo" if "Elo" in columnas else None
+    if columna_elo is None:
+        return None
+
+    exacto = df_ranking[df_ranking[columna_club].astype(str).str.lower() == nombre_equipo.lower()]
+    if not exacto.empty:
+        return float(exacto.iloc[0][columna_elo])
+
+    tokens_buscado = set(nombre_equipo.lower().split())
+    mejor_score, mejor_elo = 0.0, None
+    for _, fila in df_ranking.iterrows():
+        tokens_candidato = set(str(fila[columna_club]).lower().split())
+        union = tokens_buscado | tokens_candidato
+        if not union:
+            continue
+        score = len(tokens_buscado & tokens_candidato) / len(union)
+        if score > mejor_score:
+            mejor_score, mejor_elo = score, float(fila[columna_elo])
+
+    return mejor_elo if mejor_score >= CLUBELO_JACCARD_MINIMO else None
+
+
+def obtener_entrada_clubelo_backend(home_team, away_team):
+    """Intenta resolver el segundo modelo de un evento de soccer usando
+    ClubElo vía soccerdata, 100% calculado en el backend, sin gastar tokens
+    de búsqueda de la IA. Devuelve una entrada de registry lista para usar
+    (cobertura 'modelo_interno_elo'), o None si no se pudo resolver — en ese
+    caso el llamador debe caer a la entrada estática del registry
+    (elofootball.com) para que la IA lo busque."""
+    if not _SOCCERDATA_DISPONIBLE or not home_team or not away_team:
+        return None
+
+    fecha_hoy = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    df_ranking = _descargar_ranking_clubelo(fecha_hoy)
+    if df_ranking is None:
+        return None
+
+    elo_home = _buscar_elo_equipo(df_ranking, home_team)
+    elo_away = _buscar_elo_equipo(df_ranking, away_team)
+    if elo_home is None or elo_away is None:
+        return None
+
+    prob_home = _prob_elo(elo_home + CLUBELO_VENTAJA_LOCAL, elo_away)
+
+    return {
+        "fuente_primaria": (
+            "ClubElo (resuelto por el backend vía soccerdata/api.clubelo.com "
+            "— sin búsqueda de IA)"
+        ),
+        "fuente_secundaria": None,
+        "cobertura": "modelo_interno_elo",
+        "version": "1.0",
+        "ultima_revision": REGISTRY_ULTIMA_REVISION,
+        "probabilidad_elo_home": round(prob_home, 4),
+        "elo_home": round(elo_home, 1),
+        "elo_away": round(elo_away, 1),
+        "nota": (
+            f"Elo tomado directamente de ClubElo (fecha {fecha_hoy}), sin "
+            f"muestras/Brier propio — es el rating oficial de la fuente, no "
+            f"un modelo entrenado por Blindado."
+        ),
+    }
 
 
 # ==============================================================================
