@@ -589,31 +589,50 @@ def _extraer_bookmaker_keys(evento):
     return [b.get("key") for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key")]
 
 
+# Regiones soportadas por The Odds API. Se incluye "eu" siempre que se use
+# modo "regions" porque Pinnacle (ancla obligatoria del sistema, regla 1)
+# reporta bajo esa región — si se omite, los eventos empiezan a caer en
+# "descartados_sin_pinnacle" en vez de en el gate de liquidez.
+ODDS_API_REGIONS_COBERTURA_AMPLIA = "eu,us,us2,uk,au"
+ODDS_API_BOOKMAKERS_FIJOS = "pinnacle,stake,betonlineag,bet365"
+
+
 @st.cache_data(ttl=90, show_spinner=False)
-def obtener_cuotas_api(api_key, sport_key):
+def obtener_cuotas_api(api_key, sport_key, modo_cobertura="bookmakers_fijos"):
     """
     Consulta cuotas para un deporte específico.
-    NOTA: no se envía 'regions' junto con 'bookmakers' porque The Odds API
-    ignora 'regions' cuando 'bookmakers' está presente.
-    Cacheado 90s para no quemar cuota si el usuario da clic varias veces seguidas.
 
-    NOTA DE DIAGNÓSTICO: si notas que `_n_casas_reportando` siempre sale en 1
-    en el informe final, revisa el expander "🔍 Diagnóstico de liquidez" en la
+    modo_cobertura:
+      - "bookmakers_fijos" (default, más barato en cuota): pide únicamente los
+        4 bookmakers listados en ODDS_API_BOOKMAKERS_FIJOS. NOTA: no se envía
+        'regions' junto con 'bookmakers' porque The Odds API ignora 'regions'
+        cuando 'bookmakers' está presente. Si tu plan de The Odds API no
+        incluye alguno de esos 4 (ver expander "🔍 Diagnóstico de liquidez"),
+        ese bookmaker simplemente nunca aparecerá, silenciosamente.
+      - "regiones_amplias" (más cobertura, MÁS COSTOSO EN CUOTA): pide
+        'regions' en vez de 'bookmakers' fijos, devolviendo TODOS los
+        bookmakers disponibles en tu plan para esas regiones. The Odds API
+        cobra más cuota por request mientras más regiones se piden — revisa
+        tu consumo en la sidebar ("📉 Odds API — usados/restantes") después
+        de probar este modo.
+
+    Cacheado 90s para no quemar cuota si el usuario da clic varias veces
+    seguidas. OJO: el cache_data de Streamlit indexa por TODOS los argumentos,
+    así que cambiar modo_cobertura entre corridas SÍ dispara una llamada nueva
+    (no reutiliza el caché del otro modo).
+
+    NOTA DE DIAGNÓSTICO: si notas que `_n_casas_reportando` sale bajo en el
+    informe final, revisa el expander "🔍 Diagnóstico de liquidez" en la
     barra lateral tras ejecutar una corrida — ahí se ve, evento por evento, la
     lista CRUDA de bookmaker keys que realmente devolvió la API antes de
-    cualquier filtrado. Esto permite distinguir entre:
-      (a) un problema real de la llamada (ej. el plan de tu API key no incluye
-          esos bookmakers, o los keys 'stake'/'betonlineag'/'bet365' no son
-          los nombres correctos que espera The Odds API para tu cuenta), y
-      (b) un hecho real de mercado (esos libros efectivamente no cotizan esos
-          eventos puntuales en este momento).
+    cualquier filtrado.
     """
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
-    params = {
-        "apiKey": api_key,
-        "markets": "h2h",
-        "bookmakers": "pinnacle,stake,betonlineag,bet365",
-    }
+    params = {"apiKey": api_key, "markets": "h2h"}
+    if modo_cobertura == "regiones_amplias":
+        params["regions"] = ODDS_API_REGIONS_COBERTURA_AMPLIA
+    else:
+        params["bookmakers"] = ODDS_API_BOOKMAKERS_FIJOS
     try:
         response = requests.get(url, params=params, timeout=10)
         restantes = response.headers.get("x-requests-remaining")
@@ -1021,6 +1040,26 @@ with st.sidebar:
     if not anthropic_api_key:
         anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
 
+    st.divider()
+    modo_cobertura_label = st.radio(
+        "Cobertura de bookmakers (The Odds API):",
+        [
+            "Bookmakers fijos (barato en cuota)",
+            "Regiones amplias (más cobertura, MÁS cuota)",
+        ],
+        help=(
+            "'Bookmakers fijos' pide únicamente pinnacle/stake/betonlineag/bet365 — "
+            "si tu plan no incluye alguno de esos, simplemente no aparece, sin aviso "
+            "de la API. 'Regiones amplias' pide todos los bookmakers disponibles en "
+            "tu plan para eu+us+us2+uk+au — trae más cobertura real, pero The Odds "
+            "API cobra más cuota por request mientras más regiones se piden. Revisa "
+            "'📉 Odds API — usados/restantes' abajo después de probarlo."
+        ),
+    )
+    modo_cobertura = (
+        "regiones_amplias" if modo_cobertura_label.startswith("Regiones") else "bookmakers_fijos"
+    )
+
     if "odds_api_uso" in st.session_state:
         uso = st.session_state["odds_api_uso"]
         st.caption(f"📉 Odds API — usados: {uso['usados']} · restantes: {uso['restantes']}")
@@ -1088,14 +1127,14 @@ if api_key:
                     progress_bar = st.progress(0)
                     total_deps = len(deportes_lista)
                     for idx, dep in enumerate(deportes_lista):
-                        cuotas = obtener_cuotas_api(api_key, dep.get('key'))
+                        cuotas = obtener_cuotas_api(api_key, dep.get('key'), modo_cobertura=modo_cobertura)
                         if cuotas:
                             datos_acumulados.extend(cuotas)
                         progress_bar.progress((idx + 1) / total_deps)
                         time.sleep(0.15)  # evita ráfaga -> 429
                     progress_bar.empty()
                 else:
-                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado)
+                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado, modo_cobertura=modo_cobertura)
 
                 # --- Diagnóstico de liquidez (corregido): se construye AQUÍ,
                 # a partir de datos_acumulados ya recibido, en vez de dentro
@@ -1136,6 +1175,7 @@ if api_key:
                     lineas_mov = "\n".join(f"- {k}: {v}" for k, v in movimientos_pinnacle.items())
                     seccion_movimiento = f"MOVIMIENTOS EN PINNACLE DETECTADOS:\n{lineas_mov}"
 
+                st.caption(f"Modo de cobertura usado en esta corrida: **{modo_cobertura_label}**")
                 st.write("### 📌 Resumen de Filtrado Backend")
                 st.info(resumen_filtro)
 
