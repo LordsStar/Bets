@@ -1057,45 +1057,6 @@ with st.sidebar:
                 st.write(f"**{sport_key}** — {len(ratings)} equipos rateados, "
                          f"Brier: {brier_txt} ({n_muestras} muestras)")
 
-    # ------------------------------------------------------------------------
-    # NUEVO: expander de diagnóstico de liquidez. Solo aparece si ya se corrió
-    # al menos una consulta a obtener_cuotas_api en esta sesión. Muestra, por
-    # cada evento consultado, la lista CRUDA de bookmaker keys devuelta por
-    # The Odds API antes de cualquier filtrado — para confirmar si el `1`
-    # universal en `_n_casas_reportando` es un bug de fetch o un hecho real
-    # de mercado.
-    # ------------------------------------------------------------------------
-    if "diagnostico_bookmakers_crudo" in st.session_state and st.session_state["diagnostico_bookmakers_crudo"]:
-        with st.expander("🔍 Diagnóstico de liquidez (bookmakers crudos por evento)"):
-            registro = st.session_state["diagnostico_bookmakers_crudo"]
-            todas_las_keys_vistas = set()
-            for r in registro:
-                todas_las_keys_vistas.update(r["bookmakers_presentes"])
-
-            st.write(
-                f"**{len(registro)} eventos consultados** en esta sesión. "
-                f"Bookmaker keys distintas vistas en TODA la sesión: "
-                f"{sorted(todas_las_keys_vistas) if todas_las_keys_vistas else '— ninguna —'}"
-            )
-            if todas_las_keys_vistas == {"pinnacle"} or not todas_las_keys_vistas:
-                st.warning(
-                    "⚠️ Solo 'pinnacle' apareció en TODA la sesión, en TODOS los "
-                    "deportes consultados. Esto sugiere que 'stake', 'betonlineag' "
-                    "y/o 'bet365' no están siendo devueltos por tu API key — revisa "
-                    "en https://the-odds-api.com/account si tu plan actual incluye "
-                    "esos bookmakers, y confirma que esos son los 'key' exactos que "
-                    "usa la API (no el nombre visible del libro)."
-                )
-            st.divider()
-            for r in registro[-50:]:  # limita a los últimos 50 para no saturar la UI
-                st.write(
-                    f"- `{r['sport_key']}` — {r['partido']}: "
-                    f"{r['bookmakers_presentes'] if r['bookmakers_presentes'] else '(ninguno)'}"
-                )
-            if st.button("🗑️ Limpiar diagnóstico"):
-                st.session_state["diagnostico_bookmakers_crudo"] = []
-                st.rerun()
-
 if api_key:
     deportes_lista = obtener_deportes_activos(api_key)
 
@@ -1409,3 +1370,58 @@ if api_key:
                     )
             else:
                 st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
+
+# ==============================================================================
+# 5. DIAGNÓSTICO DE LIQUIDEZ — se renderiza AQUÍ, al final del script, a
+#    propósito.
+#
+#    POR QUÉ AQUÍ Y NO ARRIBA EN LA SIDEBAR JUNTO A LO DEMÁS: Streamlit
+#    ejecuta el archivo completo de arriba a abajo en cada interacción. El
+#    diagnóstico se calcula DENTRO del bloque del botón "Generar Prompt y
+#    Procesar Datos" (sección 4, más arriba). Si este expander se colocara
+#    antes de ese bloque en el archivo — como en la sidebar original — se
+#    dibujaría usando los datos de ANTES del clic, y el diagnóstico recién
+#    calculado quedaría un paso atrás (por eso "desaparecía": en la misma
+#    pasada del clic, se pintaba con la sesión vieja/vacía).
+#
+#    Al colocarlo aquí, después de todo el flujo del botón, Streamlit ya
+#    ejecutó el cálculo y guardó `st.session_state["diagnostico_bookmakers_crudo"]`
+#    ANTES de llegar a este punto — así que siempre muestra el resultado de
+#    la corrida que se acaba de hacer, en la misma pasada, sin necesitar un
+#    segundo clic ni un st.rerun().
+#
+#    `with st.sidebar:` se puede invocar varias veces en un mismo script —
+#    cada vez que se usa, agrega contenido al final de lo que ya hay en la
+#    barra lateral. No reemplaza lo anterior.
+# ==============================================================================
+with st.sidebar:
+    if "diagnostico_bookmakers_crudo" in st.session_state and st.session_state["diagnostico_bookmakers_crudo"]:
+        with st.expander("🔍 Diagnóstico de liquidez (bookmakers crudos por evento)", expanded=True):
+            registro = st.session_state["diagnostico_bookmakers_crudo"]
+            todas_las_keys_vistas = set()
+            for r in registro:
+                todas_las_keys_vistas.update(r["bookmakers_presentes"])
+
+            st.write(
+                f"**{len(registro)} eventos consultados** en la última corrida. "
+                f"Bookmaker keys distintas vistas: "
+                f"{sorted(todas_las_keys_vistas) if todas_las_keys_vistas else '— ninguna —'}"
+            )
+            if todas_las_keys_vistas == {"pinnacle"} or not todas_las_keys_vistas:
+                st.warning(
+                    "⚠️ Solo 'pinnacle' apareció en TODOS los eventos consultados. "
+                    "Esto sugiere que 'stake', 'betonlineag' y/o 'bet365' no están "
+                    "siendo devueltos por tu API key — revisa en "
+                    "https://the-odds-api.com/account si tu plan actual incluye "
+                    "esos bookmakers, y confirma que esos son los 'key' exactos que "
+                    "usa la API (no el nombre visible del libro)."
+                )
+            st.divider()
+            for r in registro[-50:]:  # limita a los últimos 50 para no saturar la UI
+                st.write(
+                    f"- `{r['sport_key']}` — {r['partido']}: "
+                    f"{r['bookmakers_presentes'] if r['bookmakers_presentes'] else '(ninguno)'}"
+                )
+            if st.button("🗑️ Limpiar diagnóstico"):
+                st.session_state["diagnostico_bookmakers_crudo"] = []
+                st.rerun()
