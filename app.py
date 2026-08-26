@@ -219,6 +219,49 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # ==============================================================================
 # 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
+#     Vive en código (versionado, editable a mano), NO en el prompt.
+#     "cobertura" posibles:
+#       - "externa_directa"      → fuente pública conocida, la IA debe buscarla.
+#       - "pendiente_desarrollo" → sin fuente externa Y sin Elo interno maduro
+#                                  todavía. Se descarta, nunca se improvisa.
+#       - "excluido_estructural" → se excluye antes de llegar a la IA.
+#     Los deportes marcados abajo como "usa_elo_interno": True son candidatos a
+#     que el motor Elo interno los resuelva automáticamente cuando acumule
+#     suficiente historial (ver sección 1c).
+#
+#     NUEVO v3.4 — "fuente_respaldo": fuente de respaldo DOCUMENTADA que la IA
+#     puede citar (explícitamente como respaldo, nunca como si fuera la
+#     primaria) SOLO si tanto `fuente_primaria` como `fuente_secundaria` (si
+#     existe) no exponen un número público tras un intento real de búsqueda.
+#     Se agregó para los deportes donde ESPN publica un "Matchup Predictor"
+#     públicamente accesible como alternativa razonable a fuentes que a veces
+#     están detrás de muro de pago o no exponen la probabilidad en texto
+#     buscable (ej. FanGraphs). No se agrega a deportes donde no hay un
+#     respaldo público conocido y confiable (tenis, cricket, boxeo, MMA,
+#     fútbol) — para esos, sin respaldo documentado, el evento va a categoría 2
+#     si la fuente primaria/secundaria no es accesible.
+#
+#     ACTUALIZACIÓN v3.4.2 (2026-08-23) — SOCCER: FiveThirtyEight SPI está
+#     confirmado como discontinuado/defunto y ya no es fuente válida. Además,
+#     "soccerdata" es una LIBRERÍA de Python, no un sitio web — no tiene
+#     ningún sentido ponerla en el registry para que la IA la "busque" con su
+#     herramienta de web_search (no hay nada navegable que encontrar). Por
+#     eso el rediseño real es:
+#       - El propio BACKEND resuelve ClubElo directamente con soccerdata
+#         (que internamente pega a api.clubelo.com) ANTES de armar el
+#         prompt — ver sección 1d, `obtener_entrada_clubelo_backend()`. Si
+#         funciona, el evento sale con cobertura "modelo_interno_elo" (cero
+#         tokens de búsqueda, cero riesgo de invención) igual que ya pasa
+#         con el motor Elo interno de KBO/NPB/MMA.
+#       - Esta entrada de registry para "soccer" (fuente_primaria =
+#         elofootball.com) SOLO se usa como respaldo cuando el backend no
+#         pudo resolver el evento (api.clubelo.com caída, o no se encontró
+#         alguno de los dos equipos por nombre) — ahí sí es un sitio web
+#         real, HTML plano, que la IA puede buscar y citar.
+#       - elofootball.com cubre ~55 países europeos. NO cubre Argentina,
+#         Brasil, Chile, México (Liga MX) ni MLS — para esas ligas, si el
+#         backend tampoco resolvió, el evento cae en categoría 2 sin
+#         respaldo adicional (no hay ninguna fuente documentada ahí todavía).
 # ==============================================================================
 REGISTRY_ULTIMA_REVISION = "2026-08-23"
 
@@ -274,6 +317,24 @@ def _buscar_base_registry(sport_key):
 
 # ==============================================================================
 # 1c. MOTOR ELO INTERNO — para deportes sin fuente externa confiable
+#     (KBO, NPB, MMA, y cualquier otro no cubierto).
+#
+#     CÓMO FUNCIONA:
+#     - Cada corrida consulta el endpoint /scores de The Odds API (resultados
+#       reales de los últimos días) para los deportes marcados "usa_elo_interno".
+#     - Actualiza un rating Elo por equipo/luchador usando la fórmula estándar,
+#       y guarda un historial de (probabilidad_pre_partido, resultado_real) para
+#       calcular un Brier Score histórico real — no inventado.
+#     - Solo se usa como segundo modelo válido si: (a) ambos competidores tienen
+#       un mínimo de partidos calificados, Y (b) el Brier Score histórico del
+#       modelo para ese deporte es mejor que el umbral aceptable. Si no se
+#       cumple, el evento sigue cayendo en "pendiente_desarrollo" — el sistema
+#       jamás usa un rating con historial insuficiente.
+#     - El estado se persiste en un archivo JSON local. OJO: si despliegas en
+#       una plataforma con filesystem efímero (ej. Streamlit Community Cloud
+#       sin volumen persistente), este archivo se reinicia en cada redeploy y
+#       el aprendizaje empieza de cero. Para producción real, migra
+#       `ELO_STATE_FILE` a una base de datos o almacenamiento persistente.
 # ==============================================================================
 
 try:
@@ -431,6 +492,10 @@ def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_e
     hay suficiente calidad, lo reemplaza por la entrada calculada."""
     base = _buscar_base_registry(sport_key)
 
+    # --- NUEVO v3.4.2: soccer intenta resolverse por ClubElo-backend antes
+    # de usar la entrada estática (elofootball.com). Si el backend no pudo
+    # (paquete no instalado, api.clubelo.com caída, o no encontró alguno de
+    # los dos equipos por nombre), sigue de largo con el registry normal. ---
     if sport_key and sport_key.lower().startswith("soccer") and home_team and away_team:
         resuelto_por_backend = obtener_entrada_clubelo_backend(home_team, away_team)
         if resuelto_por_backend:
@@ -460,16 +525,42 @@ def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_e
 
 
 # ==============================================================================
-# 1d. MOTOR CLUBELO POR BACKEND (soccerdata)
+# 1d. MOTOR CLUBELO POR BACKEND (soccerdata) — NUEVO v3.4.2
+#
+#     POR QUÉ EXISTE: la IA solo tiene una herramienta real, `web_search`.
+#     "soccerdata" es una librería Python — pedirle a la IA que la "busque"
+#     como si fuera un sitio web no tiene ningún efecto útil. La solución
+#     correcta es que el propio backend descargue los ratings de ClubElo
+#     (vía soccerdata, que internamente pega a api.clubelo.com) ANTES de
+#     armar el prompt, y calcule la probabilidad de resultado él mismo —
+#     exactamente el mismo patrón que ya usa el motor Elo interno para
+#     KBO/NPB/MMA (sección 1c), solo que aquí el rating no se calcula desde
+#     cero: se DESCARGA de ClubElo.
+#
+#     SI FALLA (api.clubelo.com no responde desde tu servidor, o no se
+#     encuentra alguno de los dos equipos por nombre tras el match exacto +
+#     fuzzy): esta función devuelve None, y `obtener_entrada_registry()` cae
+#     de vuelta a la entrada estática del registry para "soccer"
+#     (fuente_primaria = elofootball.com), que sí es un sitio navegable para
+#     que la IA lo busque por su cuenta.
+#
+#     REQUISITO: pip install soccerdata (y sus dependencias: pandas, etc.).
+#     Si el paquete no está instalado, `_SOCCERDATA_DISPONIBLE` queda en
+#     False y esta sección se salta por completo sin romper nada más.
 # ==============================================================================
 
-CLUBELO_VENTAJA_LOCAL = 60.0
-CLUBELO_CACHE_TTL_SEGUNDOS = 6 * 3600
-CLUBELO_JACCARD_MINIMO = 0.5
+CLUBELO_VENTAJA_LOCAL = 60.0  # ventaja de local aprox. en puntos Elo (documentada por ClubElo)
+CLUBELO_CACHE_TTL_SEGUNDOS = 6 * 3600  # ClubElo recalcula por jornada, no por minuto
+CLUBELO_JACCARD_MINIMO = 0.5  # umbral mínimo de similitud para aceptar un match fuzzy de nombre
 
 
 @st.cache_data(ttl=CLUBELO_CACHE_TTL_SEGUNDOS, show_spinner=False)
 def _descargar_ranking_clubelo(fecha_iso):
+    """Descarga el ranking ClubElo completo para una fecha (YYYY-MM-DD) usando
+    soccerdata. Devuelve un DataFrame de pandas, o None si el paquete no está
+    instalado o la descarga falla (red, api.clubelo.com caída, etc.).
+    Cacheado varias horas: ClubElo no recalcula en tiempo real, solo tras
+    cada jornada jugada."""
     if not _SOCCERDATA_DISPONIBLE:
         return None
     try:
@@ -480,6 +571,11 @@ def _descargar_ranking_clubelo(fecha_iso):
 
 
 def _buscar_elo_equipo(df_ranking, nombre_equipo):
+    """Busca un equipo en el ranking de ClubElo. Primero intenta match exacto
+    (case-insensitive); si no hay, cae a fuzzy por Jaccard de tokens — mismo
+    enfoque que ya usa el resto de Blindado para nombres de equipo que no
+    coinciden letra por letra entre The Odds API y la fuente externa (ej.
+    acentos, sufijos de ciudad, abreviaciones)."""
     if df_ranking is None or getattr(df_ranking, "empty", True) or not nombre_equipo:
         return None
 
@@ -508,6 +604,12 @@ def _buscar_elo_equipo(df_ranking, nombre_equipo):
 
 
 def obtener_entrada_clubelo_backend(home_team, away_team):
+    """Intenta resolver el segundo modelo de un evento de soccer usando
+    ClubElo vía soccerdata, 100% calculado en el backend, sin gastar tokens
+    de búsqueda de la IA. Devuelve una entrada de registry lista para usar
+    (cobertura 'modelo_interno_elo'), o None si no se pudo resolver — en ese
+    caso el llamador debe caer a la entrada estática del registry
+    (elofootball.com) para que la IA lo busque."""
     if not _SOCCERDATA_DISPONIBLE or not home_team or not away_team:
         return None
 
@@ -566,73 +668,20 @@ def obtener_deportes_activos(api_key):
         return []
 
 
-# ------------------------------------------------------------------------------
-# DIAGNÓSTICO DE LIQUIDEZ (NUEVO)
-#
-# POR QUÉ EXISTE: en una corrida reciente, los 28 eventos evaluados en TODAS
-# las familias de deporte (tenis, soccer, cricket, WNBA, MLB) mostraron
-# exactamente `_n_casas_reportando: 1` — es decir, solo Pinnacle. Que el 100%
-# de eventos en 5 deportes tan distintos (incluyendo MLB, que normalmente es
-# de los mercados más líquidos que existen) tengan CERO cobertura de stake,
-# betonlineag y bet365 es sospechoso de un problema de fetch/plan/región, no
-# de un patrón real de mercado.
-#
-# Esta función NO decide nada por sí sola ni cambia el comportamiento de
-# filtrado — solo registra qué bookmakers vinieron realmente en la respuesta
-# cruda de la API para cada evento, para poder diagnosticarlo con datos reales
-# en vez de adivinar. Se muestra en un expander de la barra lateral.
-# ------------------------------------------------------------------------------
-
-def _extraer_bookmaker_keys(evento):
-    if not isinstance(evento, dict):
-        return []
-    return [b.get("key") for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key")]
-
-
-# Regiones soportadas por The Odds API. Se incluye "eu" siempre que se use
-# modo "regions" porque Pinnacle (ancla obligatoria del sistema, regla 1)
-# reporta bajo esa región — si se omite, los eventos empiezan a caer en
-# "descartados_sin_pinnacle" en vez de en el gate de liquidez.
-ODDS_API_REGIONS_COBERTURA_AMPLIA = "eu,us,us2,uk,au"
-ODDS_API_BOOKMAKERS_FIJOS = "pinnacle,stake,betonlineag,bet365"
-
-
 @st.cache_data(ttl=90, show_spinner=False)
-def obtener_cuotas_api(api_key, sport_key, modo_cobertura="bookmakers_fijos"):
+def obtener_cuotas_api(api_key, sport_key):
     """
     Consulta cuotas para un deporte específico.
-
-    modo_cobertura:
-      - "bookmakers_fijos" (default, más barato en cuota): pide únicamente los
-        4 bookmakers listados en ODDS_API_BOOKMAKERS_FIJOS. NOTA: no se envía
-        'regions' junto con 'bookmakers' porque The Odds API ignora 'regions'
-        cuando 'bookmakers' está presente. Si tu plan de The Odds API no
-        incluye alguno de esos 4 (ver expander "🔍 Diagnóstico de liquidez"),
-        ese bookmaker simplemente nunca aparecerá, silenciosamente.
-      - "regiones_amplias" (más cobertura, MÁS COSTOSO EN CUOTA): pide
-        'regions' en vez de 'bookmakers' fijos, devolviendo TODOS los
-        bookmakers disponibles en tu plan para esas regiones. The Odds API
-        cobra más cuota por request mientras más regiones se piden — revisa
-        tu consumo en la sidebar ("📉 Odds API — usados/restantes") después
-        de probar este modo.
-
-    Cacheado 90s para no quemar cuota si el usuario da clic varias veces
-    seguidas. OJO: el cache_data de Streamlit indexa por TODOS los argumentos,
-    así que cambiar modo_cobertura entre corridas SÍ dispara una llamada nueva
-    (no reutiliza el caché del otro modo).
-
-    NOTA DE DIAGNÓSTICO: si notas que `_n_casas_reportando` sale bajo en el
-    informe final, revisa el expander "🔍 Diagnóstico de liquidez" en la
-    barra lateral tras ejecutar una corrida — ahí se ve, evento por evento, la
-    lista CRUDA de bookmaker keys que realmente devolvió la API antes de
-    cualquier filtrado.
+    NOTA: no se envía 'regions' junto con 'bookmakers' porque The Odds API
+    ignora 'regions' cuando 'bookmakers' está presente.
+    Cacheado 90s para no quemar cuota si el usuario da clic varias veces seguidas.
     """
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
-    params = {"apiKey": api_key, "markets": "h2h"}
-    if modo_cobertura == "regiones_amplias":
-        params["regions"] = ODDS_API_REGIONS_COBERTURA_AMPLIA
-    else:
-        params["bookmakers"] = ODDS_API_BOOKMAKERS_FIJOS
+    params = {
+        "apiKey": api_key,
+        "markets": "h2h",
+        "bookmakers": "pinnacle,stake,betonlineag,bet365",
+    }
     try:
         response = requests.get(url, params=params, timeout=10)
         restantes = response.headers.get("x-requests-remaining")
@@ -834,10 +883,28 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
 
 
 # ==============================================================================
-# 2b. MODO "POR DEPORTE" (v3.5)
+# 2b. MODO "POR DEPORTE" (nuevo en v3.5)
+#
+#     PROBLEMA QUE RESUELVE: con "TODOS LOS DEPORTES ACTIVOS" en un solo
+#     prompt, el presupuesto de búsqueda de la IA se reparte entre 30-40+
+#     eventos. En la práctica, esto significa que varios eventos con valor
+#     real (EV/divergencia buenos) terminan sin verificar simplemente porque
+#     la IA se quedó sin tiempo/tokens antes de llegar a ellos — no porque
+#     hayan fallado ningún umbral. Este modo divide el trabajo en varios
+#     prompts más pequeños, uno por familia de deporte, para que cada evento
+#     reciba una búsqueda real.
+#
+#     BONUS DE EFICIENCIA: los eventos con cobertura "pendiente_desarrollo" o
+#     "excluido_estructural" NUNCA necesitan que la IA busque nada — el
+#     resultado ya es 100% determinístico. Este modo los separa y genera su
+#     resumen directamente en código, con CERO tokens de IA gastados en ellos.
 # ==============================================================================
 
 def familia_deporte(sport_key):
+    """Agrupa eventos en familias amplias usando el prefijo del sport_key de
+    The Odds API (ej. 'soccer_belgium_first_div' -> 'soccer',
+    'baseball_mlb' -> 'baseball'). Sirve para dividir un prompt gigante en
+    varios prompts manejables, uno por familia."""
     if not sport_key:
         return "otros"
     return sport_key.split("_")[0]
@@ -852,6 +919,11 @@ def agrupar_eventos_por_familia(eventos):
 
 
 def separar_ia_vs_automatico(eventos_familia):
+    """Divide los eventos de una familia entre los que SÍ necesitan que la IA
+    busque y analice ('externa_directa', 'modelo_interno_elo') y los que ya
+    son descarte 100% determinístico por reglas del backend
+    ('pendiente_desarrollo', 'excluido_estructural'). Estos últimos NUNCA
+    necesitan gastar tokens de IA — el resultado ya se sabe de antemano."""
     necesita_ia, automaticos = [], []
     for ev in eventos_familia:
         cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
@@ -863,6 +935,9 @@ def separar_ia_vs_automatico(eventos_familia):
 
 
 def resumen_automatico_grupo(familia, eventos_automaticos):
+    """Genera, SIN usar IA, el resumen de descarte para eventos ya
+    determinísticos (categoría 2) — ahorra el 100% de los tokens de esos
+    eventos porque el resultado no depende de ninguna búsqueda."""
     if not eventos_automaticos:
         return None
     lineas = [
@@ -876,6 +951,9 @@ def resumen_automatico_grupo(familia, eventos_automaticos):
 
 
 def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
+    """Arma un prompt scoped a UNA familia de deporte, reutilizando el mismo
+    SYSTEM_PROMPT_BLINDADO_V3_2 (reglas idénticas), pero con el JSON limitado
+    a los eventos de esa familia que sí necesitan verificación de IA."""
     return (
         f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
         f"==================================================\n"
@@ -904,6 +982,9 @@ def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, sec
 
 
 def construir_prompts_por_deporte(eventos_filtrados, seleccion_label, hora_rd, seccion_movimiento):
+    """Devuelve (prompts_por_grupo: dict[str, str], resumen_automatico: str).
+    prompts_por_grupo solo incluye familias con al menos 1 evento que
+    necesita IA — las familias 100% automáticas no generan prompt."""
     grupos = agrupar_eventos_por_familia(eventos_filtrados)
     prompts_por_grupo = {}
     resúmenes_automaticos = []
@@ -953,6 +1034,9 @@ def listar_modelos_gemini(gemini_api_key):
 
 
 def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
+    """Llamada REST directa. Devuelve también el uso de tokens reportado en
+    'usageMetadata'. Google no expone el saldo/crédito restante de la cuenta
+    por esta vía — eso solo se ve en Google AI Studio / Cloud Console."""
     url = f"{GEMINI_API_BASE}/models/{modelo}:generateContent"
     headers = {"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"}
     body = {"contents": [{"parts": [{"text": prompt_texto}]}]}
@@ -967,6 +1051,7 @@ def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
 
 # ==============================================================================
 # 3b. CLAUDE (Anthropic) — búsqueda web FORZADA vía tool en la propia llamada.
+#     No depende de ningún toggle de interfaz: el tool viaja en el request.
 # ==============================================================================
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -984,6 +1069,22 @@ def listar_modelos_claude(anthropic_api_key):
 
 
 def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000):
+    """
+    Llama a la API de Claude con el tool de web_search FORZADO en el propio
+    request — no depende de ningún toggle manual de interfaz.
+
+    Devuelve: (texto, queries_buscadas, uso_tokens, ratelimit)
+    - uso_tokens: tokens consumidos en ESTA llamada (campo 'usage').
+    - ratelimit: headers 'anthropic-ratelimit-*' — son ventanas de tasa
+      (requests/tokens por minuto), NO el saldo en dólares de la cuenta. El
+      saldo prepagado solo se ve en console.anthropic.com → Billing.
+
+    NOTA v3.3/v3.4: con la tabla de transparencia y la sección "casi calificó"
+    activadas, esta llamada puede necesitar bastantes tokens de salida —
+    default subido a 8000. Si notas respuestas cortadas en corridas con
+    "TODOS LOS DEPORTES ACTIVOS" (muchos eventos externa_directa), considera
+    correr por deporte individual en vez de todos a la vez.
+    """
     url = f"{ANTHROPIC_API_BASE}/messages"
     headers = {
         "x-api-key": anthropic_api_key,
@@ -1039,26 +1140,6 @@ with st.sidebar:
     anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     if not anthropic_api_key:
         anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
-
-    st.divider()
-    modo_cobertura_label = st.radio(
-        "Cobertura de bookmakers (The Odds API):",
-        [
-            "Bookmakers fijos (barato en cuota)",
-            "Regiones amplias (más cobertura, MÁS cuota)",
-        ],
-        help=(
-            "'Bookmakers fijos' pide únicamente pinnacle/stake/betonlineag/bet365 — "
-            "si tu plan no incluye alguno de esos, simplemente no aparece, sin aviso "
-            "de la API. 'Regiones amplias' pide todos los bookmakers disponibles en "
-            "tu plan para eu+us+us2+uk+au — trae más cobertura real, pero The Odds "
-            "API cobra más cuota por request mientras más regiones se piden. Revisa "
-            "'📉 Odds API — usados/restantes' abajo después de probarlo."
-        ),
-    )
-    modo_cobertura = (
-        "regiones_amplias" if modo_cobertura_label.startswith("Regiones") else "bookmakers_fijos"
-    )
 
     if "odds_api_uso" in st.session_state:
         uso = st.session_state["odds_api_uso"]
@@ -1127,35 +1208,17 @@ if api_key:
                     progress_bar = st.progress(0)
                     total_deps = len(deportes_lista)
                     for idx, dep in enumerate(deportes_lista):
-                        cuotas = obtener_cuotas_api(api_key, dep.get('key'), modo_cobertura=modo_cobertura)
+                        cuotas = obtener_cuotas_api(api_key, dep.get('key'))
                         if cuotas:
                             datos_acumulados.extend(cuotas)
                         progress_bar.progress((idx + 1) / total_deps)
                         time.sleep(0.15)  # evita ráfaga -> 429
                     progress_bar.empty()
                 else:
-                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado, modo_cobertura=modo_cobertura)
+                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado)
 
-                # --- Diagnóstico de liquidez (corregido): se construye AQUÍ,
-                # a partir de datos_acumulados ya recibido, en vez de dentro
-                # de obtener_cuotas_api(). Así se genera SIEMPRE, incluso
-                # cuando obtener_cuotas_api sirvió la respuesta desde caché
-                # (@st.cache_data no vuelve a ejecutar el cuerpo de la función
-                # en un cache hit, así que cualquier efecto secundario ahí
-                # dentro — como registrar en session_state — se pierde). ---
-                diagnostico_bookmakers = []
-                for ev in datos_acumulados:
-                    if not isinstance(ev, dict):
-                        continue
-                    keys = _extraer_bookmaker_keys(ev)
-                    diagnostico_bookmakers.append({
-                        "sport_key": ev.get("sport_key"),
-                        "partido": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                        "bookmakers_presentes": keys,
-                        "n_bookmakers": len(keys),
-                    })
-                st.session_state["diagnostico_bookmakers_crudo"] = diagnostico_bookmakers
-
+                # --- Actualizar motor Elo interno para los deportes presentes
+                # que están marcados como "usa_elo_interno" en el registry ---
                 estado_elo = cargar_estado_elo()
                 sport_keys_presentes = {ev.get("sport_key") for ev in datos_acumulados if isinstance(ev, dict)}
                 for sk in sport_keys_presentes:
@@ -1175,23 +1238,8 @@ if api_key:
                     lineas_mov = "\n".join(f"- {k}: {v}" for k, v in movimientos_pinnacle.items())
                     seccion_movimiento = f"MOVIMIENTOS EN PINNACLE DETECTADOS:\n{lineas_mov}"
 
-                st.caption(f"Modo de cobertura usado en esta corrida: **{modo_cobertura_label}**")
                 st.write("### 📌 Resumen de Filtrado Backend")
                 st.info(resumen_filtro)
-
-                # --- Aviso temprano de liquidez sospechosa, visible sin tener
-                # que abrir el expander de diagnóstico ---
-                if eventos_filtrados:
-                    n_con_1_casa = sum(1 for ev in eventos_filtrados if ev.get("_n_casas_reportando", 0) < 2)
-                    if n_con_1_casa == len(eventos_filtrados):
-                        st.warning(
-                            f"⚠️ Los {len(eventos_filtrados)} eventos candidatos tienen "
-                            f"`_n_casas_reportando` < 2 (solo Pinnacle) — TODOS caerán en "
-                            f"'liquidez insuficiente' antes de llegar a validación cruzada. "
-                            f"Revisa el expander '🔍 Diagnóstico de liquidez' en la barra "
-                            f"lateral para ver si esto es un problema de la llamada a la API "
-                            f"o un hecho real de mercado."
-                        )
 
                 if not eventos_filtrados:
                     st.warning("⚠️ No se encontraron candidatos válidos en el rango 1.40 - 2.00 para los partidos de hoy.")
@@ -1351,6 +1399,10 @@ if api_key:
             else:
                 st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
 
+    # ==========================================================================
+    # MODO "POR DEPORTE" — un prompt (y opcionalmente una llamada a Claude)
+    # por cada familia de deporte que sí necesita verificación de IA.
+    # ==========================================================================
     if "prompts_por_grupo" in st.session_state and st.session_state["prompts_por_grupo"]:
         st.divider()
         st.subheader("🧩 Modo por deporte — prompts individuales")
@@ -1410,58 +1462,3 @@ if api_key:
                     )
             else:
                 st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
-
-# ==============================================================================
-# 5. DIAGNÓSTICO DE LIQUIDEZ — se renderiza AQUÍ, al final del script, a
-#    propósito.
-#
-#    POR QUÉ AQUÍ Y NO ARRIBA EN LA SIDEBAR JUNTO A LO DEMÁS: Streamlit
-#    ejecuta el archivo completo de arriba a abajo en cada interacción. El
-#    diagnóstico se calcula DENTRO del bloque del botón "Generar Prompt y
-#    Procesar Datos" (sección 4, más arriba). Si este expander se colocara
-#    antes de ese bloque en el archivo — como en la sidebar original — se
-#    dibujaría usando los datos de ANTES del clic, y el diagnóstico recién
-#    calculado quedaría un paso atrás (por eso "desaparecía": en la misma
-#    pasada del clic, se pintaba con la sesión vieja/vacía).
-#
-#    Al colocarlo aquí, después de todo el flujo del botón, Streamlit ya
-#    ejecutó el cálculo y guardó `st.session_state["diagnostico_bookmakers_crudo"]`
-#    ANTES de llegar a este punto — así que siempre muestra el resultado de
-#    la corrida que se acaba de hacer, en la misma pasada, sin necesitar un
-#    segundo clic ni un st.rerun().
-#
-#    `with st.sidebar:` se puede invocar varias veces en un mismo script —
-#    cada vez que se usa, agrega contenido al final de lo que ya hay en la
-#    barra lateral. No reemplaza lo anterior.
-# ==============================================================================
-with st.sidebar:
-    if "diagnostico_bookmakers_crudo" in st.session_state and st.session_state["diagnostico_bookmakers_crudo"]:
-        with st.expander("🔍 Diagnóstico de liquidez (bookmakers crudos por evento)", expanded=True):
-            registro = st.session_state["diagnostico_bookmakers_crudo"]
-            todas_las_keys_vistas = set()
-            for r in registro:
-                todas_las_keys_vistas.update(r["bookmakers_presentes"])
-
-            st.write(
-                f"**{len(registro)} eventos consultados** en la última corrida. "
-                f"Bookmaker keys distintas vistas: "
-                f"{sorted(todas_las_keys_vistas) if todas_las_keys_vistas else '— ninguna —'}"
-            )
-            if todas_las_keys_vistas == {"pinnacle"} or not todas_las_keys_vistas:
-                st.warning(
-                    "⚠️ Solo 'pinnacle' apareció en TODOS los eventos consultados. "
-                    "Esto sugiere que 'stake', 'betonlineag' y/o 'bet365' no están "
-                    "siendo devueltos por tu API key — revisa en "
-                    "https://the-odds-api.com/account si tu plan actual incluye "
-                    "esos bookmakers, y confirma que esos son los 'key' exactos que "
-                    "usa la API (no el nombre visible del libro)."
-                )
-            st.divider()
-            for r in registro[-50:]:  # limita a los últimos 50 para no saturar la UI
-                st.write(
-                    f"- `{r['sport_key']}` — {r['partido']}: "
-                    f"{r['bookmakers_presentes'] if r['bookmakers_presentes'] else '(ninguno)'}"
-                )
-            if st.button("🗑️ Limpiar diagnóstico"):
-                st.session_state["diagnostico_bookmakers_crudo"] = []
-                st.rerun()
