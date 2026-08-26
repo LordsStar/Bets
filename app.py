@@ -630,23 +630,7 @@ def obtener_cuotas_api(api_key, sport_key):
             st.warning(f"⚠️ Rate limit alcanzado en {sport_key}, se omite este deporte.")
             return []
         response.raise_for_status()
-        datos = response.json()
-
-        # --- Diagnóstico: acumula qué bookmaker keys vinieron REALMENTE en la
-        # respuesta cruda, antes de cualquier filtrado posterior. Se guarda en
-        # session_state para no perderlo entre llamadas cacheadas de distintos
-        # deportes dentro de la misma corrida "TODOS LOS DEPORTES ACTIVOS". ---
-        registro_diagnostico = st.session_state.setdefault("diagnostico_bookmakers_crudo", [])
-        for ev in datos:
-            keys = _extraer_bookmaker_keys(ev)
-            registro_diagnostico.append({
-                "sport_key": sport_key,
-                "partido": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                "bookmakers_presentes": keys,
-                "n_bookmakers": len(keys),
-            })
-
-        return datos
+        return response.json()
     except Exception:
         return []
 
@@ -1139,10 +1123,6 @@ if api_key:
             with st.spinner("Consultando The Odds API, actualizando motor Elo y procesando pre-filtros..."):
                 datos_acumulados = []
 
-                # Reinicia el diagnóstico de liquidez al inicio de cada corrida
-                # nueva, para que refleje solo esta ejecución.
-                st.session_state["diagnostico_bookmakers_crudo"] = []
-
                 if deporte_key_seleccionado == "ALL":
                     progress_bar = st.progress(0)
                     total_deps = len(deportes_lista)
@@ -1155,6 +1135,26 @@ if api_key:
                     progress_bar.empty()
                 else:
                     datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado)
+
+                # --- Diagnóstico de liquidez (corregido): se construye AQUÍ,
+                # a partir de datos_acumulados ya recibido, en vez de dentro
+                # de obtener_cuotas_api(). Así se genera SIEMPRE, incluso
+                # cuando obtener_cuotas_api sirvió la respuesta desde caché
+                # (@st.cache_data no vuelve a ejecutar el cuerpo de la función
+                # en un cache hit, así que cualquier efecto secundario ahí
+                # dentro — como registrar en session_state — se pierde). ---
+                diagnostico_bookmakers = []
+                for ev in datos_acumulados:
+                    if not isinstance(ev, dict):
+                        continue
+                    keys = _extraer_bookmaker_keys(ev)
+                    diagnostico_bookmakers.append({
+                        "sport_key": ev.get("sport_key"),
+                        "partido": f"{ev.get('home_team')} vs {ev.get('away_team')}",
+                        "bookmakers_presentes": keys,
+                        "n_bookmakers": len(keys),
+                    })
+                st.session_state["diagnostico_bookmakers_crudo"] = diagnostico_bookmakers
 
                 estado_elo = cargar_estado_elo()
                 sport_keys_presentes = {ev.get("sport_key") for ev in datos_acumulados if isinstance(ev, dict)}
