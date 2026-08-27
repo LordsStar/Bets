@@ -8,8 +8,8 @@ import streamlit as st
 
 # soccerdata es OPCIONAL: si no está instalado (pip install soccerdata), el
 # backend simplemente no intenta resolver ClubElo por su cuenta y soccer cae
-# directo a fuente_primaria = elofootball.com para que la IA lo busque (ver
-# sección 1d más abajo).
+# directo a fuente_primaria = elofootball.com (o ESPN Analytics para ligas no
+# europeas) para que la IA lo busque (ver sección 1d más abajo).
 try:
     import soccerdata as sd
     _SOCCERDATA_DISPONIBLE = True
@@ -219,14 +219,135 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # ==============================================================================
 # 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
+#
+# CAMBIO (este parche): soccer ya NO es una única entrada genérica que le pide
+# a la IA buscar en elofootball.com para CUALQUIER liga. elofootball cubre
+# ~55 países europeos únicamente — para una liga sudamericana, MLS, etc., pedir
+# esa fuente primaria no es "un intento que puede fallar", es estructuralmente
+# imposible que tenga el dato. Eso gastaba búsquedas/tokens en vano y empujaba
+# eventos a categoría 2 sin necesidad.
+#
+# Ahora:
+#   - Ligas que SÍ cubre elofootball → fuente_primaria = elofootball.com,
+#     fuente_respaldo = ESPN Analytics (Matchup Predictor), igual que MLB.
+#   - Ligas conocidas que elofootball NO cubre (Sudamérica, MLS, Liga MX, etc.)
+#     → fuente_primaria = ESPN Analytics directamente (sin intento fútil a
+#     elofootball primero).
+#   - Catch-all genérico "soccer" al FINAL de la lista (importa el orden: ver
+#     _buscar_base_registry, que usa "in" sobre el sport_key y toma el primer
+#     match) para cualquier liga no mapeada explícitamente todavía. Por
+#     seguridad, este catch-all también apunta a ESPN Analytics como primaria
+#     — es la fuente con mejor cobertura global, más razonable como default
+#     para una liga que no identificamos de antemano que sea europea.
 # ==============================================================================
-REGISTRY_ULTIMA_REVISION = "2026-08-23"
+REGISTRY_ULTIMA_REVISION = "2026-08-27"
 
 MODEL_REGISTRY = [
     {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
      "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
-    {"patron": "soccer", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+
+    # --- SOCCER: ligas europeas cubiertas por elofootball.com -------------
+    # (patrones de sport_key típicos de The Odds API; ajusta/agrega según los
+    # que realmente veas en tu cuenta con obtener_deportes_activos)
+    {"patron": "soccer_epl", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
      "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_efl_champ", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_germany_bundesliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_germany_bundesliga2", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_italy_serie_a", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_italy_serie_b", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_spain_la_liga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_spain_segunda_division", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_france_ligue_one", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_france_ligue_two", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_netherlands_eredivisie", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_portugal_primeira_liga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_belgium_first_div", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_turkey_super_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_switzerland_superleague", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_austria_bundesliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_greece_super_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_denmark_superliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_sweden_allsvenskan", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_champs_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_europa_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_europa_conference_league", "fuente_primaria": "elofootball.com",
+     "fuente_secundaria": None, "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+
+    # --- SOCCER: ligas NO cubiertas por elofootball.com --------------------
+    # (Sudamérica, Norteamérica no-europea, etc.) → directo a ESPN Analytics
+    # como fuente_primaria, sin pasar por un intento fútil en elofootball.
+    {"patron": "soccer_brazil_campeonato", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_brazil_serie_b", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_argentina_primera_division", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_mexico_ligamx", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_usa_mls", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_conmebol_copa_libertadores", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_conmebol_copa_sudamericana", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_chile_campeonato", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_colombia_primera_a", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+
+    # --- SOCCER: catch-all genérico — DEBE IR AL FINAL de todos los "soccer_*"
+    # de arriba, porque _buscar_base_registry hace matching por substring
+    # ("patron" in sport_key_low) y toma el primer match de la lista. Si este
+    # catch-all quedara antes, interceptaría a TODAS las ligas específicas.
+    # Por defecto apunta a ESPN Analytics (mejor cobertura global) en vez de
+    # elofootball, para no asumir de entrada que una liga no mapeada es
+    # europea.
+    {"patron": "soccer", "fuente_primaria": "ESPN Analytics (Matchup Predictor)", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.3", "usa_elo_interno": False},
+
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
      "usa_elo_interno": False},
@@ -428,7 +549,14 @@ def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
 def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
     """Punto único de verdad para el segundo modelo de un evento: primero mira
     el registry estático; si ese deporte está marcado para usar Elo interno y
-    hay suficiente calidad, lo reemplaza por la entrada calculada."""
+    hay suficiente calidad, lo reemplaza por la entrada calculada.
+
+    Para soccer, ANTES de mirar el registry estático se intenta ClubElo vía
+    soccerdata (resuelto 100% por backend, sin gastar búsqueda de IA). Si eso
+    falla o no está disponible, se cae al registry estático — que ahora, tras
+    este parche, ya distingue entre ligas europeas (elofootball + respaldo
+    ESPN) y ligas no europeas (ESPN directo), en vez de mandar todo a
+    elofootball.com sin importar la liga."""
     base = _buscar_base_registry(sport_key)
 
     if sport_key and sport_key.lower().startswith("soccer") and home_team and away_team:
@@ -567,7 +695,7 @@ def obtener_deportes_activos(api_key):
 
 
 # ------------------------------------------------------------------------------
-# DIAGNÓSTICO DE LIQUIDEZ (NUEVO)
+# DIAGNÓSTICO DE LIQUIDEZ
 #
 # POR QUÉ EXISTE: en una corrida reciente, los 28 eventos evaluados en TODAS
 # las familias de deporte (tenis, soccer, cricket, WNBA, MLB) mostraron
@@ -581,6 +709,10 @@ def obtener_deportes_activos(api_key):
 # filtrado — solo registra qué bookmakers vinieron realmente en la respuesta
 # cruda de la API para cada evento, para poder diagnosticarlo con datos reales
 # en vez de adivinar. Se muestra en un expander de la barra lateral.
+#
+# NOTA: esta instrumentación ya es GENÉRICA — corre sobre `datos_acumulados`
+# en la sección 4 sin importar qué deporte se haya seleccionado (soccer
+# incluido). No hace falta duplicarla por deporte.
 # ------------------------------------------------------------------------------
 
 def _extraer_bookmaker_keys(evento):
@@ -1136,13 +1268,15 @@ if api_key:
                 else:
                     datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado, modo_cobertura=modo_cobertura)
 
-                # --- Diagnóstico de liquidez (corregido): se construye AQUÍ,
-                # a partir de datos_acumulados ya recibido, en vez de dentro
-                # de obtener_cuotas_api(). Así se genera SIEMPRE, incluso
-                # cuando obtener_cuotas_api sirvió la respuesta desde caché
+                # --- Diagnóstico de liquidez: se construye AQUÍ, a partir de
+                # datos_acumulados ya recibido, en vez de dentro de
+                # obtener_cuotas_api(). Así se genera SIEMPRE, incluso cuando
+                # obtener_cuotas_api sirvió la respuesta desde caché
                 # (@st.cache_data no vuelve a ejecutar el cuerpo de la función
                 # en un cache hit, así que cualquier efecto secundario ahí
-                # dentro — como registrar en session_state — se pierde). ---
+                # dentro — como registrar en session_state — se pierde).
+                # Genérico: cubre TODOS los deportes de la corrida, soccer
+                # incluido, sin necesidad de código específico por deporte. ---
                 diagnostico_bookmakers = []
                 for ev in datos_acumulados:
                     if not isinstance(ev, dict):
@@ -1432,7 +1566,8 @@ if api_key:
 #
 #    `with st.sidebar:` se puede invocar varias veces en un mismo script —
 #    cada vez que se usa, agrega contenido al final de lo que ya hay en la
-#    barra lateral. No reemplaza lo anterior.
+#    barra lateral. No reemplaza lo anterior. Esto aplica a TODOS los
+#    deportes de la corrida (soccer incluido), no solo MLB.
 # ==============================================================================
 with st.sidebar:
     if "diagnostico_bookmakers_crudo" in st.session_state and st.session_state["diagnostico_bookmakers_crudo"]:
