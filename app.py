@@ -17,19 +17,23 @@ except ImportError:
     _SOCCERDATA_DISPONIBLE = False
 
 # ==============================================================================
-# 1. SYSTEM PROMPT V3.4 — BLINDADO
+# 1. SYSTEM PROMPT V3.5 — BLINDADO
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
 #    relativo, Model Registry obligatorio, motor Elo interno calibrado como
 #    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
-#    tabla de transparencia de descartes (v3.3), y ahora (v3.4):
+#    tabla de transparencia de descartes (v3.3), y ahora (v3.4 + v3.5):
 #      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
 #      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
 #        registry) para cuando la fuente primaria no expone un número público.
 #      - Sección de salida "CASI CALIFICÓ" con los eventos más cercanos al
 #        umbral que no pasaron.
+#      - NUEVO v3.5: Gate de riesgo de empate para fútbol/soccer — obliga a
+#        usar Draw No Bet (estimado matemáticamente desde el devig 1X2) o a
+#        penalizar la Confianza cuando la probabilidad de empate de Pinnacle
+#        es alta, para no perder picks con EV positivo por un empate.
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_2 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.4)
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.5)
 
 ROL Y OBJETIVO:
 Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
@@ -112,6 +116,34 @@ METODOLOGÍA Y REGLAS CLAVE:
      72h según [fuente/búsqueda]") — la ausencia de hallazgos debe quedar
      documentada, no asumida.
 
+3c. GATE DE RIESGO DE EMPATE — SOLO FÚTBOL/SOCCER (nuevo en v3.5):
+   El mercado moneyline en fútbol es a 3 resultados: el empate es una fuga
+   real de EV incluso en picks matemáticamente positivos. Para TODO evento
+   cuyo `sport_key` empiece con "soccer", ANTES de confirmar un pick en
+   moneyline, evalúa el campo `_prob_empate_pinnacle` (probabilidad de-vigged
+   de empate según Pinnacle):
+
+   - Si `_prob_empate_pinnacle >= 0.30` (30%): el evento NO puede recomendarse
+     en moneyline puro. Si el evento pasó los umbrales de EV/divergencia,
+     usa en su lugar el campo `_draw_no_bet_estimado` para ese lado:
+       - Cuota a usar: `cuota_justa_dnb_estimada`.
+       - Probabilidad del segundo modelo: renormalízala tú mismo excluyendo
+         el empate, con la misma fórmula que usa el backend:
+         P_dnb_modelo(lado) = P_modelo(lado) / (P_modelo(home) + P_modelo(away))
+       - Recalcula el EV% con esa cuota y esa probabilidad renormalizada.
+       - En el informe, el campo "Mercado" debe decir explícitamente
+         "Draw No Bet (estimado desde 1X2, no es cuota real de mercado)" —
+         nunca lo presentes como si fuera un moneyline normal.
+   - Si `0.25 <= _prob_empate_pinnacle < 0.30`: puedes recomendar moneyline,
+     pero DEBES bajar la Confianza en al menos 2 puntos de forma explícita,
+     citando el % de empate como motivo (ej. "Confianza reducida por riesgo
+     de empate: Pinnacle de-vigged asigna 27% a empate").
+   - Si `_prob_empate_pinnacle < 0.25`: no se requiere ajuste por este motivo.
+
+   Esta regla es ADICIONAL a los gates de EV/divergencia/confianza — no los
+   reemplaza. Un evento puede pasar EV y divergencia y aun así requerir DNB
+   en lugar de moneyline, o ver reducida su Confianza, por esta regla.
+
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
    Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
 
@@ -133,6 +165,7 @@ METODOLOGÍA Y REGLAS CLAVE:
    - Para tenis/boxeo/MMA: resultado del chequeo de estado físico (regla 3b).
      Una noticia real de lesión/molestia no cuantificable en el rating debe
      bajar este componente de forma explícita.
+   - Para fútbol: resultado del gate de riesgo de empate (regla 3c).
    Un pick solo califica si la confianza total es >= 8/10.
 
 REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
@@ -152,6 +185,10 @@ REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
   búsqueda — solo se usa después de haber intentado realmente la fuente primaria
   y, si aplica, la secundaria, y haber confirmado que ninguna expone un número
   público.
+- El campo `_draw_no_bet_estimado` es una ESTIMACIÓN matemática del backend
+  (renormalización del devig 1X2 de Pinnacle sin el empate), no una cuota real
+  ofrecida por ningún libro. Nunca la presentes como cuota de mercado — siempre
+  aclara que es estimada.
 
 CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (v3.3, ajustada en v3.4):
 Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
@@ -165,7 +202,8 @@ siguientes para ese evento):
    4º EV por debajo del umbral (regla 5)
    5º Divergencia por encima del umbral (regla 5)
    6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
-      (incluye el caso de una señal de estado físico no cuantificable, regla 3b)
+      (incluye el caso de una señal de estado físico no cuantificable, regla 3b,
+      o de riesgo de empate no compensado con DNB, regla 3c)
 Un evento NUNCA debe contarse en dos categorías a la vez.
 
 AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
@@ -180,6 +218,9 @@ FORMATO DE SALIDA (obligatorio, en español):
 2. Si hay pick: Partido | Mercado | Cuota Pinnacle | Prob. implícita de-vigged |
    Prob. segundo modelo (con fuente/métricas) | EV% | Confianza (con desglose) |
    Justificación en 3-4 líneas.
+   Para fútbol: el campo "Mercado" debe indicar "Moneyline" o "Draw No Bet
+   (estimado)" según lo que haya determinado la regla 3c — nunca lo dejes
+   ambiguo.
 3. Si NO hay pick: decirlo explícitamente en la primera línea ("PICK DEL DÍA:
    NINGUNO") y explicar brevemente, por categoría, por qué ningún evento
    alcanzó el umbral.
@@ -199,7 +240,8 @@ FORMATO DE SALIDA (obligatorio, en español):
      descartado en 4 o 5, escribe "N/A — descartado antes de este cálculo").
    - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
      "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
-     6/10 — fuente externa reciente pero noticia de lesión no cuantificable").
+     6/10 — fuente externa reciente pero noticia de lesión no cuantificable",
+     "Confianza 6/10 — riesgo de empate 27% (regla 3c)").
 5. CASI CALIFICÓ (nuevo en v3.4): de los eventos en categorías 4, 5 y 6 que SÍ
    tuvieron datos reales calculados (no los marcados "N/A — no se pudo
    verificar"), identifica los 1-3 que estuvieron más cerca de pasar TODOS los
@@ -800,6 +842,51 @@ def devig_probabilidades(outcomes):
     return {nombre: round(p / overround, 4) for nombre, p in implicitas.items()}
 
 
+def calcular_draw_no_bet(pinnacle_devig, home_name, away_name):
+    """
+    Calcula la cuota JUSTA de Draw No Bet (DNB) a partir de las probabilidades
+    de-vigged de Pinnacle en el mercado 1X2 (ya viene calculado en
+    `_pinnacle_devig`, no se pide nada nuevo a la API).
+
+    QUÉ RESUELVE: en el mercado moneyline de fútbol, un pick con EV positivo
+    puede perderse igual si el partido termina empatado — el empate es una
+    fuga de EV real que el moneyline puro no protege. DNB es un mercado donde,
+    si hay empate, se devuelve el stake (push): elimina esa fuga.
+
+    FÓRMULA: al quitar el empate del universo de resultados, las probabilidades
+    de home/away se renormalizan entre sí:
+        P_dnb(home) = P(home) / (P(home) + P(away))
+        P_dnb(away) = P(away) / (P(home) + P(away))
+    y la cuota justa es 1 / P_dnb. Esto es una ESTIMACIÓN matemática desde el
+    1X2 — no es la cuota real de un libro en su mercado DNB (que puede diferir
+    levemente por el margen propio de ese mercado). Se etiqueta como tal.
+    """
+    p_home = pinnacle_devig.get(home_name)
+    p_away = pinnacle_devig.get(away_name)
+    if p_home is None or p_away is None or (p_home + p_away) <= 0:
+        return None
+
+    p_dnb_home = p_home / (p_home + p_away)
+    p_dnb_away = p_away / (p_home + p_away)
+
+    return {
+        "nota": (
+            "Cuota justa DNB ESTIMADA matemáticamente desde el devig 1X2 de "
+            "Pinnacle (renormalizando sin el empate) — no es una cuota de "
+            "mercado real, es un techo teórico. Úsala solo como referencia "
+            "de rango, no la cites como si fuera cuota ofrecida por un libro."
+        ),
+        home_name: {
+            "prob_dnb": round(p_dnb_home, 4),
+            "cuota_justa_dnb_estimada": round(1 / p_dnb_home, 3) if p_dnb_home > 0 else None,
+        },
+        away_name: {
+            "prob_dnb": round(p_dnb_away, 4),
+            "cuota_justa_dnb_estimada": round(1 / p_dnb_away, 3) if p_dnb_away > 0 else None,
+        },
+    }
+
+
 def calcular_dispersion_mercado(evento):
     """Mide la dispersión de probabilidades entre casas de apuestas, tomando el
     spread máximo encontrado en CUALQUIER resultado del mercado (home, away,
@@ -934,6 +1021,18 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
         elif registry_entry["cobertura"] == "pendiente_desarrollo":
             eventos_pendientes_desarrollo += 1
 
+        # --- Riesgo de empate (solo fútbol, mercados a 3 resultados) -------
+        # Se calcula acá, en el backend, para que la IA no tenga que inventar
+        # o recalcular el devig de DNB por su cuenta — reduce fabricación y
+        # gasta 0 tokens de búsqueda. Ver regla 3c del prompt.
+        es_soccer = bool(evento.get("sport_key", "").lower().startswith("soccer"))
+        prob_empate_pinnacle = pinnacle_devig.get("Draw") if es_soccer else None
+        draw_no_bet_estimado = (
+            calcular_draw_no_bet(pinnacle_devig, home_team, away_team)
+            if es_soccer and prob_empate_pinnacle is not None
+            else None
+        )
+
         evento_minificado = {
             "id": evento.get("id"),
             "deporte": evento.get("sport_title") or evento.get("sport_key"),
@@ -948,6 +1047,11 @@ def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
             "_n_casas_reportando": n_bookmakers,
             "_registry_modelo_secundario": registry_entry,
         }
+
+        if es_soccer and prob_empate_pinnacle is not None:
+            evento_minificado["_prob_empate_pinnacle"] = prob_empate_pinnacle
+            evento_minificado["_draw_no_bet_estimado"] = draw_no_bet_estimado
+
         eventos_validos.append(evento_minificado)
 
     resumen_filtro = (
@@ -1028,8 +1132,9 @@ def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, sec
         f"(ese conteo se reporta aparte, fuera de la IA).\n\n"
         f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
         f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
-        f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
-        f"de-vig ni filtres por rango nuevamente.\n\n"
+        f"`_n_casas_reportando`, `_registry_modelo_secundario` y, para fútbol, "
+        f"`_prob_empate_pinnacle` / `_draw_no_bet_estimado` (regla 3c). No "
+        f"recalcules el de-vig ni filtres por rango nuevamente.\n\n"
         f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS (solo familia '{familia}'):\n"
         f"{json.dumps(eventos_grupo, indent=2, ensure_ascii=False)}"
     )
@@ -1156,7 +1261,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno & Modo por Deporte)")
+st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno, Modo por Deporte & Gate de Empate)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
@@ -1327,6 +1432,19 @@ if api_key:
                             f"o un hecho real de mercado."
                         )
 
+                    n_soccer_riesgo_empate_alto = sum(
+                        1 for ev in eventos_filtrados
+                        if ev.get("_prob_empate_pinnacle") is not None
+                        and ev["_prob_empate_pinnacle"] >= 0.30
+                    )
+                    if n_soccer_riesgo_empate_alto:
+                        st.info(
+                            f"⚽ {n_soccer_riesgo_empate_alto} evento(s) de fútbol tienen "
+                            f"probabilidad de empate (Pinnacle de-vigged) ≥ 30% — el prompt "
+                            f"instruye a la IA a usar Draw No Bet estimado en vez de "
+                            f"moneyline para esos casos (regla 3c)."
+                        )
+
                 if not eventos_filtrados:
                     st.warning("⚠️ No se encontraron candidatos válidos en el rango 1.40 - 2.00 para los partidos de hoy.")
                 elif modo_ejecucion.startswith("Todo en un solo prompt"):
@@ -1343,8 +1461,9 @@ if api_key:
                         f"{seccion_movimiento}\n\n"
                         f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
                         f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
-                        f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
-                        f"de-vig ni filtres por rango nuevamente.\n\n"
+                        f"`_n_casas_reportando`, `_registry_modelo_secundario` y, para fútbol, "
+                        f"`_prob_empate_pinnacle` / `_draw_no_bet_estimado` (regla 3c). No "
+                        f"recalcules el de-vig ni filtres por rango nuevamente.\n\n"
                         f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS:\n"
                         f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
                     )
