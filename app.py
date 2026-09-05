@@ -21,7 +21,7 @@ except ImportError:
 #    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
 #    relativo, Model Registry obligatorio, motor Elo interno calibrado como
 #    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
-#    tabla de transparencia de descartes (v3.3), y ahora (v3.4 + v3.5):
+#    tabla de transparencia de descartes (v3.3), y ahora (v3.4 + v3.5 + v3.6):
 #      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
 #      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
 #        registry) para cuando la fuente primaria no expone un número público.
@@ -31,9 +31,14 @@ except ImportError:
 #        usar Draw No Bet (estimado matemáticamente desde el devig 1X2) o a
 #        penalizar la Confianza cuando la probabilidad de empate de Pinnacle
 #        es alta, para no perder picks con EV positivo por un empate.
+#      - NUEVO v3.6: Cobertura real de esports (14 títulos con sport_key
+#        confirmado de The Odds API) vía Liquipedia/HLTV/VLR.gg/Octane.gg, y
+#        excepción explícita al gate de liquidez mínima (regla 4) para
+#        eventos "esports_*", que estructuralmente reportan menos casas de
+#        apuestas que los deportes tradicionales.
 # ==============================================================================
 SYSTEM_PROMPT_BLINDADO_V3_2 = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.5)
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.6)
 
 ROL Y OBJETIVO:
 Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
@@ -146,6 +151,18 @@ METODOLOGÍA Y REGLAS CLAVE:
 
 4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
    Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
+
+   EXCEPCIÓN ESPORTS (nuevo en v3.6): para eventos cuyo `sport_key` empiece
+   con "esports", esta regla de liquidez mínima NO aplica. Nunca descartes un
+   evento de esports en la categoría 3 por tener menos de 2 casas reportando
+   (incluso si solo reporta Pinnacle). Motivo: los mercados de esports tienen
+   estructuralmente mucha menos cobertura de bookmakers que los deportes
+   tradicionales — exigir el mismo mínimo los descartaría de forma sistemática
+   sin relación real con la calidad del pick. Aun así, sigue reportando el
+   valor real de `_liquidez_backend` y `_n_casas_reportando` en el informe
+   (transparencia), y esta excepción NO exime al evento del resto de las
+   reglas — EV, divergencia y confianza (reglas 5 y 6) se evalúan igual, sin
+   excepción, para esports.
 
 5. UMBRALES DE DESCARTE (ajustados v3.3 — ligeramente más permisivos que v3.2):
    - EV < 4% → descartar (antes 5%).
@@ -281,6 +298,25 @@ ANTHROPIC_VERSION = "2023-06-01"
 #     seguridad, este catch-all también apunta a ESPN Analytics como primaria
 #     — es la fuente con mejor cobertura global, más razonable como default
 #     para una liga que no identificamos de antemano que sea europea.
+#
+#   - AGREGADO: entradas para ESPORTS con los `sport_key` reales confirmados
+#     de The Odds API — CS2 (esports_csgo, HLTV), Valorant (esports_valorant,
+#     VLR.gg), League of Legends (esports_lol), Dota 2 (esports_dota2),
+#     Overwatch (esports_overwatch), StarCraft II (esports_starcraft2),
+#     Honor of Kings (esports_kingofglory), Rainbow Six Siege (esports_r6),
+#     Rocket League (esports_rl, Octane.gg), Mobile Legends: Bang Bang
+#     (esports_mlbb), PUBG (esports_pubg), Call of Duty (esports_cod), League
+#     of Legends: Wild Rift (esports_wildrift) y StarCraft: Brood War
+#     (esports_bw) — más un catch-all genérico "esports" → Liquipedia para
+#     cualquier título nuevo que Odds API agregue y no esté mapeado todavía.
+#     Antes de esto, cualquier evento con sport_key "esports_*" caía directo
+#     a DEFAULT_REGISTRY_ENTRY ("pendiente_desarrollo") y dependía 100% de
+#     que el motor Elo interno acumulara historial desde cero — ahora tienen
+#     fuente externa real desde el día uno, igual que fútbol o tenis.
+#     NOTA: además, la regla 4 del prompt (LIQUIDEZ) trae una excepción
+#     explícita para "esports_*" — no se descartan por menos de 2 casas
+#     reportando, porque estructuralmente tienen menos cobertura de
+#     bookmakers que deportes tradicionales (ver esa regla para el detalle).
 # ==============================================================================
 REGISTRY_ULTIMA_REVISION = "2026-08-27"
 
@@ -389,6 +425,62 @@ MODEL_REGISTRY = [
     # europea.
     {"patron": "soccer", "fuente_primaria": "ESPN Analytics (Matchup Predictor)", "fuente_secundaria": None,
      "cobertura": "externa_directa", "version": "1.3", "usa_elo_interno": False},
+
+    # --- ESPORTS -------------------------------------------------------
+    # Igual que soccer: entradas específicas por título ANTES del catch-all
+    # genérico "esports" (el orden importa por el matching por substring en
+    # _buscar_base_registry). Ninguna de estas fuentes es un Elo calibrado
+    # propio como TennisAbstract — son rankings editoriales/estadísticos
+    # públicos, por eso quedan como "externa_directa" (requieren búsqueda
+    # real de la IA, igual que fútbol), no como "modelo_interno_elo".
+    {"patron": "esports_csgo", "fuente_primaria": "HLTV (World Ranking)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (CS2 rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_valorant", "fuente_primaria": "VLR.gg (rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (Valorant rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_lol", "fuente_primaria": "Liquipedia (LoL power rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Oracle's Elixir (stats por equipo)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_dota2", "fuente_primaria": "Liquipedia (Dota 2 rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "OpenDota (stats por equipo)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_overwatch", "fuente_primaria": "Liquipedia (Overwatch rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_kingofglory", "fuente_primaria": "Liquipedia (King of Glory rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_starcraft2", "fuente_primaria": "Liquipedia (StarCraft II rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_r6", "fuente_primaria": "Liquipedia (Rainbow Six Siege rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_rl", "fuente_primaria": "Octane.gg (Rocket League ratings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (Rocket League rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_mlbb", "fuente_primaria": "Liquipedia (Mobile Legends: Bang Bang rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_pubg", "fuente_primaria": "Liquipedia (PUBG rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_cod", "fuente_primaria": "Liquipedia (Call of Duty rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_wildrift", "fuente_primaria": "Liquipedia (League of Legends: Wild Rift rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_bw", "fuente_primaria": "Liquipedia (StarCraft: Brood War rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    # Catch-all genérico "esports" — DEBE IR AL FINAL de los "esports_*"
+    # específicos de arriba, por el mismo motivo que el catch-all "soccer":
+    # si quedara antes, interceptaría a todos los títulos ya mapeados.
+    {"patron": "esports", "fuente_primaria": "Liquipedia (rankings del título correspondiente)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
 
     {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
      "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
@@ -1261,7 +1353,7 @@ def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000)
 # ==============================================================================
 
 st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
-st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno, Modo por Deporte & Gate de Empate)")
+st.title("📊 Analista de Apuesta Única v3.6 (Multi-IA, Multi-Deporte, Motor Elo Interno, Modo por Deporte, Gate de Empate & Esports)")
 
 with st.sidebar:
     st.header("🔑 Configuración de APIs")
@@ -1443,6 +1535,24 @@ if api_key:
                             f"probabilidad de empate (Pinnacle de-vigged) ≥ 30% — el prompt "
                             f"instruye a la IA a usar Draw No Bet estimado en vez de "
                             f"moneyline para esos casos (regla 3c)."
+                        )
+
+                    n_esports = sum(
+                        1 for ev in eventos_filtrados
+                        if (ev.get("sport_key") or "").lower().startswith("esports")
+                    )
+                    if n_esports:
+                        n_esports_baja_liquidez = sum(
+                            1 for ev in eventos_filtrados
+                            if (ev.get("sport_key") or "").lower().startswith("esports")
+                            and ev.get("_n_casas_reportando", 0) < 2
+                        )
+                        st.info(
+                            f"🎮 {n_esports} evento(s) de esports en esta corrida "
+                            f"({n_esports_baja_liquidez} con menos de 2 casas reportando). "
+                            f"Por regla 4 del prompt, esports está EXENTO del gate de "
+                            f"liquidez mínima — no se descartarán por esa causa, aunque "
+                            f"sigan evaluándose normalmente en EV/divergencia/confianza."
                         )
 
                 if not eventos_filtrados:
