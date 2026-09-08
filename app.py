@@ -1,1615 +1,3294 @@
 import json
 import os
-import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import streamlit as st
 
+# soccerdata es OPCIONAL: si no está instalado (pip install soccerdata), el
+# backend simplemente no intenta resolver ClubElo por su cuenta y soccer cae
+# directo a fuente_primaria = elofootball.com para que la IA lo busque (ver
+# sección 1d más abajo).
+try:
+    import soccerdata as sd
+    _SOCCERDATA_DISPONIBLE = True
+except ImportError:
+    _SOCCERDATA_DISPONIBLE = False
 
-# ============================================================
-# STAKE-FIRST / FREE-SOURCES / BLINDADO
-# ============================================================
-# No The Odds API.
-# No API-Sports.
-# No paid sports-data API is required.
-#
-# Primary execution market:
-#   Stake Sports Data API oficial.
-#
-# Secondary market reference:
-#   Bovada public coupon endpoints.
-#
-# Free/public context sources:
-#   Sports Reference / FBref
-#   Baseball Savant
-#   Tennis Abstract
-#   UFC Stats
-#   BoxRec
-#   HLTV / VLR / Liquipedia / OpenDota / Oracle's Elixir / Octane
-#   additional source URLs are registered below.
-#
-# The app deliberately refuses to manufacture a probability when
-# the free-data layer cannot verify enough information.
-# ============================================================
+# ==============================================================================
+# 1. SYSTEM PROMPT V3.4 — BLINDADO
+#    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
+#    relativo, Model Registry obligatorio, motor Elo interno calibrado como
+#    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
+#    tabla de transparencia de descartes (v3.3), y ahora (v3.4):
+#      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
+#      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
+#        registry) para cuando la fuente primaria no expone un número público.
+#      - Sección de salida "CASI CALIFICÓ" con los eventos más cercanos al
+#        umbral que no pasaron.
+# ==============================================================================
+SYSTEM_PROMPT_BLINDADO_V3_2 = """
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.4)
 
+ROL Y OBJETIVO:
+Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
+seleccionar UNA sola apuesta —la de mayor confianza estadística— dentro de un rango
+de cuota 1.40-2.00 (moneyline o mercado principal), de TODOS los eventos recibidos.
+Un informe con 0 picks es un resultado VÁLIDO y ESPERADO en la mayoría de los días.
+Nunca fuerces un pick para "tener algo que mostrar".
 
-APP_VERSION = "5.1-stake-sports-data-api"
-UTC = timezone.utc
-BASE_DIR = Path(__file__).resolve().parent
-STATE_DIR = BASE_DIR / "state"
-STATE_DIR.mkdir(exist_ok=True)
-STAKE_SNAPSHOT_FILE = STATE_DIR / "stake_snapshots.json"
-BOVADA_SNAPSHOT_FILE = STATE_DIR / "bovada_snapshots.json"
-PROMOTIONS_FILE = STATE_DIR / "promotions.json"
-ELO_FILE = STATE_DIR / "elo_state.json"
+METODOLOGÍA Y REGLAS CLAVE:
 
-STAKE_ODDS_DATA_URL = "https://odds-data.stake.com"
-DEFAULT_TIMEOUT = 20
+1. ANCLA OBLIGATORIA: Usa directamente el campo `_pinnacle_devig` que el backend ya
+   calculó. No recalcules el de-vig.
 
-STAKE_SPORT_SLUGS = [
-    "soccer", "basketball", "baseball", "ice-hockey", "tennis",
-    "american-football", "mma", "boxing", "cricket", "rugby",
-    "volleyball", "table-tennis", "counter-strike", "dota-2",
-    "league-of-legends", "valorant",
-]
+2. GATE DE FRESCURA (relativo al tiempo restante, NO un umbral fijo):
+   Pinnacle solo actualiza el precio cuando se mueve la línea. Si a un evento le
+   faltan muchas horas para empezar, es NORMAL que `_pinnacle_last_update` tenga
+   varias horas de antigüedad — eso NO es dato obsoleto, es un mercado tranquilo.
+   Compara `_pinnacle_last_update` contra `inicio_utc`, no contra la hora actual:
+   - Si al evento le faltan MENOS de 3 horas para empezar Y `_pinnacle_last_update`
+     tiene más de 90 minutos de antigüedad → señal real de posible dato
+     desactualizado cerca del cierre del mercado → DESCARTA el evento.
+   - Si al evento le faltan MÁS de 3 horas, la antigüedad de `_pinnacle_last_update`
+     es solo informativa: NO descartes el evento por este motivo.
 
-BOVADA_ENDPOINTS = {
-    "baseball_mlb": "https://www.bovada.lv/services/sports/event/coupon/events/A/description/baseball/mlb",
-    "basketball_nba": "https://www.bovada.lv/services/sports/event/coupon/events/A/description/basketball/nba",
-    "icehockey_nhl": "https://www.bovada.lv/services/sports/event/coupon/events/A/description/hockey/nhl",
-    "americanfootball_nfl": "https://www.bovada.lv/services/sports/event/coupon/events/A/description/football/nfl",
-    "americanfootball_ncaaf": "https://www.bovada.lv/services/sports/event/coupon/events/A/description/football/college-football",
-}
+3. VALIDACIÓN CRUZADA (Segundo Modelo) — EXCLUSIVAMENTE vía Model Registry:
+   Cada evento trae `_registry_modelo_secundario` con la fuente autorizada para
+   ese deporte específico. Reglas ESTRICTAS según el campo `cobertura`:
 
-# Free/public sources. These are reference pages; not all expose a stable API.
-FREE_SOURCES = {
-    "mlb": [
-        "https://baseballsavant.mlb.com/statcast_search",
-        "https://www.fangraphs.com/",
-        "https://www.baseball-reference.com/",
-    ],
-    "nba": [
-        "https://www.basketball-reference.com/",
-        "https://www.nba.com/stats/",
-    ],
-    "wnba": [
-        "https://www.basketball-reference.com/wnba/",
-        "https://stats.wnba.com/",
-    ],
-    "nfl": [
-        "https://www.pro-football-reference.com/",
-        "https://github.com/nflverse/nflfastR-data",
-    ],
-    "nhl": [
-        "https://www.hockey-reference.com/",
-        "https://www.nhl.com/stats/",
-    ],
-    "soccer": [
-        "https://fbref.com/en/",
-        "https://github.com/statsbomb/open-data",
-    ],
-    "tennis": [
-        "https://www.tennisabstract.com/",
-        "https://www.atptour.com/",
-        "https://www.wtatennis.com/",
-    ],
-    "mma": [
-        "http://ufcstats.com/",
-        "https://www.sherdog.com/",
-    ],
-    "boxing": [
-        "https://boxrec.com/",
-    ],
-    "f1": [
-        "https://www.formula1.com/",
-        "https://github.com/f1db/f1db",
-    ],
-    "cricket": [
-        "https://cricsheet.org/",
-        "https://www.espncricinfo.com/",
-    ],
-    "esports": [
-        "https://liquipedia.net/",
-        "https://www.hltv.org/",
-        "https://www.vlr.gg/",
-        "https://www.opendota.com/",
-        "https://oracleselixir.com/",
-        "https://octane.gg/",
-    ],
-    "other": [
-        "https://www.espn.com/",
-    ],
-}
+   - "externa_directa": debes REALIZAR la búsqueda web real en `fuente_primaria`
+     (o `fuente_secundaria` si la primaria falla) ANTES de concluir que no se
+     puede verificar. Prohibido responder "no se puede confirmar" sin haber
+     intentado la búsqueda.
+     - RESPALDO DOCUMENTADO (nuevo en v3.4): si ni `fuente_primaria` ni
+       `fuente_secundaria` exponen un número públicamente accesible tras un
+       intento real de búsqueda, revisa si el evento trae un campo
+       `fuente_respaldo` en el registry. Si existe, puedes usarlo — pero
+       cítalo EXPLÍCITAMENTE como respaldo, nunca como si fuera la fuente
+       primaria. Ejemplo correcto: "Fuente: ESPN Analytics — Matchup
+       Predictor (respaldo documentado; FanGraphs no expuso un número
+       público tras la búsqueda)".
+     - Si NO hay `fuente_respaldo` documentada y ninguna de las fuentes
+       oficiales dio un número verificable, el evento se descarta en la
+       categoría 2 (segundo modelo no disponible), con nota "fuente primaria
+       inaccesible, sin respaldo documentado". PROHIBIDO improvisar o
+       sustituir con una fuente no listada en el registry ni en su campo
+       `fuente_respaldo`.
 
+   - "modelo_interno_elo": el backend YA calculó una probabilidad calibrada con
+     resultados reales recientes (no es una fuente web). Usa directamente los
+     campos `probabilidad_elo_home`, `elo_home`, `elo_away`,
+     `brier_score_historico` y `muestras_brier` como segundo modelo — NO hace
+     falta buscar en la web para estos eventos. Cita la fuente como:
+     "Modelo Elo interno (backend), calibrado con {muestras_brier} resultados
+     reales, Brier histórico {brier_score_historico}".
 
-BLINDADO_PROMPT = """
-PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v4.1 — Stake First)
+   - "pendiente_desarrollo": no hay fuente externa definida NI historial Elo
+     interno suficiente todavía para ese equipo/deporte. DESCARTA
+     automáticamente sin buscar en otro lado y sin usar un modelo "propio"
+     improvisado — eso sería fabricación.
 
-OBJETIVO:
-Seleccionar COMO MÁXIMO UNA sola apuesta ejecutable en Stake.com.
-Un resultado de 0 picks es válido y preferido cuando no existe evidencia suficiente.
+   - "excluido_estructural": ya debería venir excluido del JSON; si aparece,
+     descarta sin análisis (partidos de exhibición/preseason).
 
-REGLAS:
-1. STAKE ES LA ANCLA DE EJECUCIÓN.
-   La cuota final y el mercado recomendado deben existir realmente en Stake.
-   EV se calcula con la cuota efectiva de Stake, incluyendo una promoción aplicable.
+   PROHIBIDO ABSOLUTO: usar cualquier fuente, rating o modelo que no aparezca
+   literalmente en `_registry_modelo_secundario` de ese evento específico
+   (ya sea en `fuente_primaria`, `fuente_secundaria`, o `fuente_respaldo`).
 
-2. FUENTES DE MERCADO:
-   Stake = mercado principal.
-   Bovada = referencia secundaria.
-   Ninguna cuota de Bovada sustituye una cuota de Stake.
+3b. CHEQUEO DE ESTADO FÍSICO — OBLIGATORIO PARA TENIS, BOXEO Y MMA (nuevo en v3.4):
+   Además de la fuente de rating (TennisAbstract, BoxRec, etc.), para estos tres
+   deportes DEBES hacer una búsqueda web adicional específica sobre noticias
+   recientes (últimas 48-72h) de lesión, retiro, molestia física, o estado de
+   forma del competidor. Un rating Elo o ranking NO captura esto — solo refleja
+   resultados pasados, no el estado físico actual.
+   - Si encuentras una noticia real y citable de lesión/molestia/duda física
+     relevante que el rating no puede haber incorporado todavía, esto reduce
+     la Confianza (regla 6) de forma explícita, aunque EV y divergencia pasen
+     los umbrales. Nunca ignores esta señal solo porque el EV se ve atractivo.
+   - Si no encuentras nada relevante tras la búsqueda, decláralo explícitamente
+     en el informe (ej. "Sin noticias de lesión/estado físico en las últimas
+     72h según [fuente/búsqueda]") — la ausencia de hallazgos debe quedar
+     documentada, no asumida.
 
-3. DATOS GRATUITOS:
-   Usar únicamente fuentes públicas registradas por deporte.
-   No rellenar estadísticas faltantes con suposiciones.
+4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
+   Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
 
-4. FRESCURA:
-   Si el precio de Stake no tiene timestamp o no puede verificarse su estado,
-   el evento puede ser descartado.
+5. UMBRALES DE DESCARTE (ajustados v3.3 — ligeramente más permisivos que v3.2):
+   - EV < 4% → descartar (antes 5%).
+   - Divergencia |Pinnacle - Segundo Modelo| > 9% → descartar (antes 7%; señal
+     de posible error de datos, no de "value").
+   - Si el segundo modelo es "modelo_interno_elo" y `brier_score_historico` es
+     peor que 0.23 o `muestras_brier` < 8, el backend ya lo habría excluido —
+     pero si por alguna razón lo ves con esos valores, descarta igual.
 
-5. SEGUNDO MODELO:
-   Prioridad:
-   a) modelo Elo interno calibrado con resultados reales suficientes;
-   b) modelo de mercado Bovada de-vigged como referencia secundaria;
-   c) si ninguno está disponible, DESCARTAR.
-   No presentar una estimación de mercado como si fuera un modelo estadístico independiente.
+6. CONFIANZA (1-10): Calcula con el siguiente desglose visible en el informe:
+   - Edge estadístico (EV real vs. umbral)
+   - Calidad/frescura de la fuente del segundo modelo (una fuente externa
+     reciente pesa más que un modelo interno con pocas muestras; una fuente
+     de respaldo documentada pesa menos que la fuente primaria oficial)
+   - Liquidez del mercado
+   - Coherencia entre movimiento de línea (si hay datos) y el pick
+   - Para tenis/boxeo/MMA: resultado del chequeo de estado físico (regla 3b).
+     Una noticia real de lesión/molestia no cuantificable en el rating debe
+     bajar este componente de forma explícita.
+   Un pick solo califica si la confianza total es >= 8/10.
 
-6. EV:
-   EV = P_modelo * (cuota_efectiva - 1) - (1 - P_modelo)
-   Equivalente: EV = P_modelo * cuota_efectiva - 1.
-   Umbral mínimo: 4%.
+REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
+- Nunca inventes lesiones, alineaciones, clima o noticias que no hayas confirmado
+  con una fuente real y citada.
+- Nunca inventes cuotas, nombres de equipos/jugadores o resultados históricos que
+  no estén en el JSON de entrada o en una fuente web verificada.
+- Si falta cualquier dato necesario para completar el análisis de un evento, ese
+  evento se descarta — nunca se rellena el vacío con una suposición "razonable".
+- Cada afirmación estadística debe llevar su fuente (nombre + URL, "Modelo Elo
+  interno" con sus métricas si aplica, o la fuente de respaldo citada como tal).
+- Si un evento se descartó en la categoría 1, 2 o 3 (frescura, pendiente_desarrollo
+  /fuente inaccesible sin respaldo, o liquidez), NUNCA calcules ni inventes un EV%
+  o divergencia% para él — en esos casos ni siquiera se llegó a evaluar el segundo
+  modelo. Repórtalo como "N/A — no se calculó" en la tabla de la sección 4.
+- El campo `fuente_respaldo` NUNCA se usa por comodidad o para ahorrar una
+  búsqueda — solo se usa después de haber intentado realmente la fuente primaria
+  y, si aplica, la secundaria, y haber confirmado que ninguna expone un número
+  público.
 
-7. DIVERGENCIA:
-   Si existe una probabilidad de referencia Bovada/Elo:
-   |P_modelo - P_referencia| > 9 puntos porcentuales => DESCARTAR.
+CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (v3.3, ajustada en v3.4):
+Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
+de prioridad (aplica la primera que corresponda y detente ahí, no evalúes las
+siguientes para ese evento):
+   1º Gate de frescura (regla 2)
+   2º Segundo modelo no disponible — "pendiente_desarrollo" O "externa_directa"
+      sin fuente primaria/secundaria accesible NI `fuente_respaldo` documentada
+      (regla 3)
+   3º Liquidez insuficiente — menos de 2 casas (regla 4)
+   4º EV por debajo del umbral (regla 5)
+   5º Divergencia por encima del umbral (regla 5)
+   6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
+      (incluye el caso de una señal de estado físico no cuantificable, regla 3b)
+Un evento NUNCA debe contarse en dos categorías a la vez.
 
-8. CONFIANZA:
-   Debe ser >= 8/10.
-   Considerar edge, calidad/frescura, liquidez, movimiento, datos deportivos y promociones.
+AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
+Suma (eventos por cada categoría de descarte) + (1 si hay pick, 0 si no) debe
+ser EXACTAMENTE igual al número total de eventos evaluados que recibiste en el
+JSON. Si no cuadra, revisa tu categorización y corrígela antes de responder —
+no entregues un informe con números que no concilien.
 
-9. TENIS / BOXEO / MMA:
-   Buscar/confirmar estado físico reciente cuando se disponga de búsqueda web.
-   Si no puede verificarse y el dato es crítico, no forzar el pick.
+FORMATO DE SALIDA (obligatorio, en español):
+1. Resumen: cuántos eventos se evaluaron y el desglose EXACTO por categoría
+   (las 6 de arriba), con la verificación de que suman el total.
+2. Si hay pick: Partido | Mercado | Cuota Pinnacle | Prob. implícita de-vigged |
+   Prob. segundo modelo (con fuente/métricas) | EV% | Confianza (con desglose) |
+   Justificación en 3-4 líneas.
+3. Si NO hay pick: decirlo explícitamente en la primera línea ("PICK DEL DÍA:
+   NINGUNO") y explicar brevemente, por categoría, por qué ningún evento
+   alcanzó el umbral.
+4. TABLA DE TRANSPARENCIA — solo para eventos que SÍ llegaron a calcularse
+   (categorías 4, 5 y 6 — EV insuficiente, divergencia excesiva, o confianza
+   <8/10). Para las categorías 1, 2 y 3 (frescura, pendiente_desarrollo/fuente
+   inaccesible, liquidez insuficiente) NO se arma tabla evento por evento —
+   repórtalas solo como conteo agregado en el resumen (punto 1), porque en esas
+   categorías nunca se llegó a calcular EV ni divergencia y desglosarlas no
+   aporta información nueva.
 
-10. FÚTBOL:
-   El moneyline 1X2 tiene riesgo de empate.
-   Si P(draw) >= 30%, no recomendar ML puro salvo que exista un mercado DNB REAL en Stake
-   y pueda calcularse con la cuota real de Stake. Nunca usar una cuota DNB estimada como si
-   fuera una cuota ofrecida.
+   Formato de la tabla (una fila por evento de las categorías 4/5/6):
+   | Partido | Categoría | EV% | Divergencia% | Confianza | Motivo breve (1 línea) |
 
-11. PROMOCIONES:
-   Odds Boost: usar la cuota boost real.
-   Refund/insurance: calcular valor esperado con la probabilidad del evento de refund.
-   Bonos de cuenta: solo aplicar si el usuario los declara como elegibles.
-   Nunca asumir que una promoción es universal.
-
-12. ANTI-FABRICACIÓN:
-   Si falta información crítica, DESCARTAR.
-   No inventar cuotas, lesiones, alineaciones, estadísticas, resultados o promociones.
-
-SALIDA:
-PICK DEL DÍA: NINGUNO, o una única selección.
-Mostrar: evento, mercado, Stake odds, probabilidad modelo, EV, confianza,
-fuentes y motivo.
+   - EV% y Divergencia%: el número real calculado, con 1-2 decimales.
+   - Confianza: solo aplica si el evento llegó a la categoría 6 (si fue
+     descartado en 4 o 5, escribe "N/A — descartado antes de este cálculo").
+   - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
+     "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
+     6/10 — fuente externa reciente pero noticia de lesión no cuantificable").
+5. CASI CALIFICÓ (nuevo en v3.4): de los eventos en categorías 4, 5 y 6 que SÍ
+   tuvieron datos reales calculados (no los marcados "N/A — no se pudo
+   verificar"), identifica los 1-3 que estuvieron más cerca de pasar TODOS los
+   umbrales — por ejemplo, divergencia apenas sobre el 9%, EV apenas debajo del
+   4%, o confianza a 1-2 puntos de 8/10. Preséntalos en una tabla corta,
+   ordenada de más cerca a menos cerca del umbral:
+   | Partido | Qué faltó | Qué tan cerca (número exacto vs. umbral) |
+   Si ningún evento tiene datos reales suficientes para esta comparación,
+   omite la tabla y dilo explícitamente: "No hay eventos con datos suficientes
+   para evaluar cercanía al umbral en esta corrida."
 """
 
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
+ANTHROPIC_VERSION = "2023-06-01"
 
-# -----------------------------
-# Generic utilities
-# -----------------------------
-def utc_now() -> datetime:
-    return datetime.now(UTC)
+# ==============================================================================
+# 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
+#     Vive en código (versionado, editable a mano), NO en el prompt.
+#     "cobertura" posibles:
+#       - "externa_directa"      → fuente pública conocida, la IA debe buscarla.
+#       - "pendiente_desarrollo" → sin fuente externa Y sin Elo interno maduro
+#                                  todavía. Se descarta, nunca se improvisa.
+#       - "excluido_estructural" → se excluye antes de llegar a la IA.
+#     Los deportes marcados abajo como "usa_elo_interno": True son candidatos a
+#     que el motor Elo interno los resuelva automáticamente cuando acumule
+#     suficiente historial (ver sección 1c).
+#
+#     NUEVO v3.4 — "fuente_respaldo": fuente de respaldo DOCUMENTADA que la IA
+#     puede citar (explícitamente como respaldo, nunca como si fuera la
+#     primaria) SOLO si tanto `fuente_primaria` como `fuente_secundaria` (si
+#     existe) no exponen un número público tras un intento real de búsqueda.
+#     Se agregó para los deportes donde ESPN publica un "Matchup Predictor"
+#     públicamente accesible como alternativa razonable a fuentes que a veces
+#     están detrás de muro de pago o no exponen la probabilidad en texto
+#     buscable (ej. FanGraphs). No se agrega a deportes donde no hay un
+#     respaldo público conocido y confiable (tenis, cricket, boxeo, MMA,
+#     fútbol) — para esos, sin respaldo documentado, el evento va a categoría 2
+#     si la fuente primaria/secundaria no es accesible.
+#
+#     ACTUALIZACIÓN v3.4.2 (2026-08-23) — SOCCER: FiveThirtyEight SPI está
+#     confirmado como discontinuado/defunto y ya no es fuente válida. Además,
+#     "soccerdata" es una LIBRERÍA de Python, no un sitio web — no tiene
+#     ningún sentido ponerla en el registry para que la IA la "busque" con su
+#     herramienta de web_search (no hay nada navegable que encontrar). Por
+#     eso el rediseño real es:
+#       - El propio BACKEND resuelve ClubElo directamente con soccerdata
+#         (que internamente pega a api.clubelo.com) ANTES de armar el
+#         prompt — ver sección 1d, `obtener_entrada_clubelo_backend()`. Si
+#         funciona, el evento sale con cobertura "modelo_interno_elo" (cero
+#         tokens de búsqueda, cero riesgo de invención) igual que ya pasa
+#         con el motor Elo interno de KBO/NPB/MMA.
+#       - Esta entrada de registry para "soccer" (fuente_primaria =
+#         elofootball.com) SOLO se usa como respaldo cuando el backend no
+#         pudo resolver el evento (api.clubelo.com caída, o no se encontró
+#         alguno de los dos equipos por nombre) — ahí sí es un sitio web
+#         real, HTML plano, que la IA puede buscar y citar.
+#       - elofootball.com cubre ~55 países europeos. NO cubre Argentina,
+#         Brasil, Chile, México (Liga MX) ni MLS — para esas ligas, si el
+#         backend tampoco resolvió, el evento cae en categoría 2 sin
+#         respaldo adicional (no hay ninguna fuente documentada ahí todavía).
+# ==============================================================================
+REGISTRY_ULTIMA_REVISION = "2026-08-23"
+
+MODEL_REGISTRY = [
+    {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
+     "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "basketball_nba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "basketball_wnba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "basketball_ncaab", "fuente_primaria": "Basketball-Reference (NCAA)", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "icehockey_nhl", "fuente_primaria": "Hockey-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "cricket", "fuente_primaria": "ICC Team Ratings", "fuente_secundaria": "ESPN Cricinfo",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "boxing", "fuente_primaria": "BoxRec ratings", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "mma", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "americanfootball_nfl", "fuente_primaria": "ESPN FPI (Football Power Index)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+]
+
+DEFAULT_REGISTRY_ENTRY = {
+    "fuente_primaria": None, "fuente_secundaria": None,
+    "cobertura": "pendiente_desarrollo", "version": "0.0", "usa_elo_interno": True,
+}
 
 
-def parse_dt(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    if isinstance(value, (int, float)):
+def _buscar_base_registry(sport_key):
+    if not sport_key:
+        return dict(DEFAULT_REGISTRY_ENTRY)
+    sport_key_low = sport_key.lower()
+    return dict(next((e for e in MODEL_REGISTRY if e["patron"] in sport_key_low), DEFAULT_REGISTRY_ENTRY))
+
+
+# ==============================================================================
+# 1c. MOTOR ELO INTERNO — para deportes sin fuente externa confiable
+#     (KBO, NPB, MMA, y cualquier otro no cubierto).
+#
+#     CÓMO FUNCIONA:
+#     - Cada corrida consulta el endpoint /scores de The Odds API (resultados
+#       reales de los últimos días) para los deportes marcados "usa_elo_interno".
+#     - Actualiza un rating Elo por equipo/luchador usando la fórmula estándar,
+#       y guarda un historial de (probabilidad_pre_partido, resultado_real) para
+#       calcular un Brier Score histórico real — no inventado.
+#     - Solo se usa como segundo modelo válido si: (a) ambos competidores tienen
+#       un mínimo de partidos calificados, Y (b) el Brier Score histórico del
+#       modelo para ese deporte es mejor que el umbral aceptable. Si no se
+#       cumple, el evento sigue cayendo en "pendiente_desarrollo" — el sistema
+#       jamás usa un rating con historial insuficiente.
+#     - El estado se persiste en un archivo JSON local. OJO: si despliegas en
+#       una plataforma con filesystem efímero (ej. Streamlit Community Cloud
+#       sin volumen persistente), este archivo se reinicia en cada redeploy y
+#       el aprendizaje empieza de cero. Para producción real, migra
+#       `ELO_STATE_FILE` a una base de datos o almacenamiento persistente.
+# ==============================================================================
+
+try:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _BASE_DIR = os.getcwd()
+ELO_STATE_FILE = os.path.join(_BASE_DIR, "elo_state.json")
+ELO_INICIAL = 1500.0
+ELO_K_FACTOR = 20.0
+ELO_VENTAJA_LOCAL = 50.0
+ELO_MIN_PARTIDOS_POR_EQUIPO = 5
+ELO_MIN_MUESTRAS_BRIER = 8
+ELO_BRIER_MAXIMO_ACEPTABLE = 0.23  # peor que esto = descartar (naive/azar = 0.25)
+ELO_DIAS_HISTORIAL_SCORES = 3      # máximo permitido por el endpoint /scores
+
+
+def cargar_estado_elo():
+    if os.path.exists(ELO_STATE_FILE):
         try:
-            v = float(value)
-            if v > 10_000_000_000:
-                v /= 1000.0
-            return datetime.fromtimestamp(v, UTC)
+            with open(ELO_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
-            return None
-    s = str(value).strip()
+            pass
+    return {"ratings": {}, "procesados": {}, "historial_brier": {}}
+
+
+def guardar_estado_elo(estado):
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(UTC)
-    except Exception:
-        pass
+        with open(ELO_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.warning(f"No se pudo guardar el estado del motor Elo interno: {e}")
+
+
+def _prob_elo(elo_a, elo_b):
+    return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
+
+
+def calcular_brier(historial_sport):
+    if not historial_sport:
+        return None
+    return sum((h["prob"] - h["resultado"]) ** 2 for h in historial_sport) / len(historial_sport)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_scores_api(api_key, sport_key, dias=ELO_DIAS_HISTORIAL_SCORES):
+    """Resultados reales recientes (partidos ya jugados) para alimentar el motor
+    Elo interno. Cacheado 1h porque los resultados no cambian dentro de esa
+    ventana y cada llamada consume cuota de The Odds API."""
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/scores/"
+    params = {"apiKey": api_key, "daysFrom": dias}
     try:
-        v = float(s)
-        if v > 10_000_000_000:
-            v /= 1000.0
-        return datetime.fromtimestamp(v, UTC)
-    except Exception:
-        return None
-
-
-def decimal_from_any(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip().replace(",", ".")
-    if not s:
-        return None
-    # American odds SIEMPRE llevan signo explícito (+150, -200). Hay que
-    # detectarlas ANTES de intentar float(s) directo: Python acepta el "+"
-    # como prefijo válido en float("+150") == 150.0, lo que las confundiría
-    # con una cuota decimal absurda de 150.0 en vez de la 2.5 real.
-    m = re.fullmatch(r"([+-])\s*(\d+(?:\.\d+)?)", s)
-    if m:
-        n = float(m.group(2))
-        if m.group(1) == "+":
-            return 1.0 + n / 100.0
-        if n:
-            return 1.0 + 100.0 / n
-        return None
-    try:
-        x = float(s)
-        if x > 1.0:
-            return x
-    except Exception:
-        pass
-    return None
-
-
-def devig(odds: Dict[str, float]) -> Dict[str, float]:
-    clean = {k: float(v) for k, v in odds.items() if v and v > 1.0}
-    if not clean:
-        return {}
-    raw = {k: 1.0 / v for k, v in clean.items()}
-    total = sum(raw.values())
-    return {k: p / total for k, p in raw.items()} if total else {}
-
-
-def ev_decimal(prob: float, odds: float) -> float:
-    return prob * odds - 1.0
-
-
-def kelly_fraction(prob: float, odds: float) -> float:
-    b = odds - 1.0
-    if b <= 0:
-        return 0.0
-    q = 1.0 - prob
-    return max(0.0, (b * prob - q) / b)
-
-
-def stake_amount(
-    bankroll: float,
-    prob: float,
-    odds: float,
-    fraction: float = 0.25,
-    min_pct: float = 0.005,
-    max_pct: float = 0.05,
-) -> float:
-    k = kelly_fraction(prob, odds) * fraction
-    k = min(max(k, min_pct), max_pct)
-    return round(bankroll * k, 2)
-
-
-def safe_get(d: Dict[str, Any], *keys: str, default=None):
-    cur: Any = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(k)
-    return cur
-
-
-def save_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-# -----------------------------
-# HTTP
-# -----------------------------
-class HttpClient:
-    def __init__(self, timeout: int = DEFAULT_TIMEOUT):
-        self.timeout = timeout
-        self.session = requests.Session()
-        # NOTA DIAGNÓSTICO (403 en stake.com/_api/graphql):
-        # Un 403 en este punto casi siempre es un bloqueo de WAF/Cloudflare
-        # ANTES de llegar a resolver el GraphQL, no un error de tu query.
-        # Estos headers imitan más de cerca a un navegador real, pero si
-        # Stake usa un challenge de Cloudflare basado en JS (no solo en
-        # headers), ningún header por sí solo lo resuelve con `requests` —
-        # necesitarías algo como curl_cffi/tls-client (que imita la huella
-        # TLS de un navegador real) o un navegador headless (Playwright).
-        # Antes de escalar a eso, confirma primero si el bloqueo es por IP
-        # de datacenter (ver mensaje de chat) probando desde tu máquina local.
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "es-DO,es;q=0.9,en;q=0.8",
-            "Origin": "https://stake.com",
-            "Referer": "https://stake.com/sports",
-            "Content-Type": "application/json",
-            "x-apollo-operation-name": "SportsEvents",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        })
-
-    def get_json(self, url: str, params: Optional[dict] = None) -> Any:
-        r = self.session.get(url, params=params, timeout=self.timeout)
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code in (401, 422, 429):
+            return []
         r.raise_for_status()
         return r.json()
-
-    def post_json(self, url: str, payload: dict, headers: Optional[dict] = None) -> Any:
-        h = {"Content-Type": "application/json"}
-        if headers:
-            h.update(headers)
-        r = self.session.post(url, json=payload, headers=h, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
-
-
-@dataclass
-class NormalizedOutcome:
-    selection: str
-    odds: float
-    active: bool = True
-    point: Optional[float] = None
-
-
-@dataclass
-class NormalizedMarket:
-    key: str
-    name: str
-    outcomes: List[NormalizedOutcome]
-
-
-@dataclass
-class NormalizedEvent:
-    event_id: str
-    source: str
-    sport: str
-    league: str
-    home: str
-    away: str
-    start_time: Optional[str]
-    is_live: bool
-    status: str
-    last_update: str
-    markets: List[NormalizedMarket]
-    raw: Dict[str, Any]
-
-
-def stake_market_key(name: str) -> str:
-    n = (name or "").lower()
-    if any(x in n for x in ["winner", "moneyline", "match winner", "1x2", "3-way"]):
-        return "moneyline"
-    if "draw no bet" in n or n == "dnb":
-        return "draw_no_bet"
-    if "spread" in n or "handicap" in n:
-        return "spread"
-    if "total" in n or "over/under" in n:
-        return "totals"
-    return re.sub(r"[^a-z0-9]+", "_", n).strip("_") or "market"
-
-
-# -----------------------------
-# Stake Sports Data API oficial
-# -----------------------------
-class StakeSportsDataCollector:
-    """Descarga fixtures y cuotas sin login, cookies ni sesión de usuario.
-
-    La lista ``/sport/{slug}/fixture`` contiene metadatos. Las cuotas completas
-    se obtienen de ``/fixtures/{fixture-slug}``, por eso los detalles se
-    consultan en paralelo con un límite conservador.
-    """
-
-    def __init__(
-        self,
-        client: Optional[HttpClient] = None,
-        delay: float = 0.0,
-        max_workers: int = 6,
-        api_key: Optional[str] = None,
-    ):
-        self.client = client or HttpClient()
-        self.delay = max(0.0, float(delay))
-        self.max_workers = max(1, min(int(max_workers), 10))
-        key = api_key or os.environ.get("STAKE_ODDS_API_KEY", "")
-        if key:
-            # Hoy la lectura funciona sin clave, pero la documentación declara
-            # esta cabecera. Dejarla opcional evita cambios de código futuros.
-            self.client.session.headers["X-API-KEY"] = key
-
-    def _get(self, path: str) -> Any:
-        last_error: Optional[Exception] = None
-        for attempt in range(3):
-            try:
-                data = self.client.get_json(f"{STAKE_ODDS_DATA_URL}{path}")
-                if self.delay:
-                    time.sleep(self.delay)
-                return data
-            except Exception as exc:
-                last_error = exc
-                if attempt < 2:
-                    time.sleep(0.6 * (2 ** attempt))
-        raise RuntimeError(f"Stake Sports Data API falló en {path}: {last_error}")
-
-    def fetch_sport(self, sport_slug: str, first: int = 100) -> List[NormalizedEvent]:
-        listing = self._get(f"/sport/{sport_slug}/fixture")
-        fixtures = listing.get("fixture", []) if isinstance(listing, dict) else []
-        fixtures = [f for f in fixtures if isinstance(f, dict) and f.get("slug")][:first]
-        if not fixtures:
-            return []
-
-        events: List[NormalizedEvent] = []
-        errors: List[str] = []
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(fixtures))) as pool:
-            jobs = {
-                pool.submit(self._get, f"/fixtures/{fixture['slug']}"): fixture
-                for fixture in fixtures
-            }
-            for job in as_completed(jobs):
-                fixture = jobs[job]
-                try:
-                    detail = job.result()
-                    event = self.normalize_api_event(sport_slug, fixture, detail)
-                    if event.event_id and event.markets:
-                        events.append(event)
-                except Exception as exc:
-                    errors.append(f"{fixture.get('slug', '?')}: {exc}")
-
-        if errors:
-            st.warning(
-                f"Stake API: {len(errors)} evento(s) de {sport_slug} no pudieron cargarse."
-            )
-        return events
-
-    def fetch_all(self, slugs: Optional[Iterable[str]] = None) -> List[NormalizedEvent]:
-        all_events: List[NormalizedEvent] = []
-        failed_sports: List[str] = []
-        for slug in list(slugs or STAKE_SPORT_SLUGS):
-            try:
-                all_events.extend(self.fetch_sport(slug))
-            except Exception as exc:
-                failed_sports.append(f"{slug}: {exc}")
-        if failed_sports:
-            st.warning("Stake API sin respuesta para: " + "; ".join(failed_sports))
-        return dedupe_events(all_events)
-
-    @staticmethod
-    def _flatten_markets(groups: Any) -> List[Dict[str, Any]]:
-        """Aplana groups[].markets[][] y elimina copias por ID."""
-        found: List[Dict[str, Any]] = []
-        seen = set()
-        for group in groups if isinstance(groups, list) else []:
-            if not isinstance(group, dict):
-                continue
-            for bundle in group.get("markets") or []:
-                candidates = bundle if isinstance(bundle, list) else [bundle]
-                for market in candidates:
-                    if not isinstance(market, dict):
-                        continue
-                    marker = market.get("id") or (
-                        market.get("name"), market.get("specifiers", "")
-                    )
-                    if marker in seen:
-                        continue
-                    seen.add(marker)
-                    found.append(market)
-        return found
-
-    @classmethod
-    def normalize_api_event(
-        cls,
-        sport_slug: str,
-        listing_fixture: Dict[str, Any],
-        detail: Dict[str, Any],
-    ) -> NormalizedEvent:
-        node = detail.get("fixture", {}) if isinstance(detail, dict) else {}
-        if not isinstance(node, dict):
-            node = {}
-        competitors = listing_fixture.get("competitors") or []
-        names = [c.get("name", "") if isinstance(c, dict) else str(c) for c in competitors]
-        if len(names) < 2:
-            # Respaldo para respuestas donde Stake omita competitors.
-            names = re.split(r"\s+-\s+", str(node.get("name") or listing_fixture.get("name", "")), maxsplit=1)
-        home = names[0] if names else ""
-        away = names[1] if len(names) > 1 else ""
-        markets: List[NormalizedMarket] = []
-        newest_update = parse_dt(node.get("updatedAt") or listing_fixture.get("updatedAt"))
-        for m in cls._flatten_markets(detail.get("groups", [])):
-            if str(m.get("status", "active")).lower() not in ("active", "open"):
-                continue
-            outs: List[NormalizedOutcome] = []
-            for o in m.get("outcomes") or []:
-                if not isinstance(o, dict):
-                    continue
-                odd = decimal_from_any(o.get("odds"))
-                active = bool(o.get("active", True))
-                if odd and odd > 1 and active:
-                    outs.append(NormalizedOutcome(
-                        selection=str(o.get("name", "")),
-                        odds=odd,
-                        active=active,
-                        point=decimal_from_any(o.get("point")),
-                    ))
-            if outs:
-                markets.append(NormalizedMarket(
-                    key=stake_market_key(str(m.get("name", ""))),
-                    name=str(m.get("name", "")),
-                    outcomes=outs,
-                ))
-                market_update = parse_dt(m.get("updatedAt"))
-                if market_update and (not newest_update or market_update > newest_update):
-                    newest_update = market_update
-
-        tournament = listing_fixture.get("tournament") or {}
-        if isinstance(tournament, dict):
-            league = tournament.get("slug") or tournament.get("name")
-        else:
-            league = str(tournament)
-        league = league or listing_fixture.get("tournamentId", "")
-        start = parse_dt(node.get("startTime") or listing_fixture.get("startTime"))
-        raw_status = str(node.get("status") or listing_fixture.get("status") or "unknown")
-        is_live = raw_status.lower() in {"live", "inplay", "in-play", "in_play"}
-        return NormalizedEvent(
-            event_id=str(node.get("id") or listing_fixture.get("id", "")),
-            source="stake",
-            sport=str(sport_slug),
-            league=str(league or ""),
-            home=home,
-            away=away,
-            start_time=start.isoformat() if start else None,
-            is_live=is_live,
-            status=raw_status,
-            last_update=(newest_update or utc_now()).isoformat(),
-            markets=markets,
-            raw={"fixture": node, "listing": listing_fixture, "groups": detail.get("groups", [])},
-        )
-
-
-# Alias conservado para que stake_fetcher_local.py y otros imports existentes
-# sigan funcionando mientras migramos el flujo principal.
-StakeCollector = StakeSportsDataCollector
-
-
-# -----------------------------
-# Bovada collector
-# -----------------------------
-def _walk_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _walk_dicts(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _walk_dicts(v)
-
-
-def _find_event_dicts(payload: Any) -> List[Dict[str, Any]]:
-    out = []
-    seen = set()
-    if isinstance(payload, dict):
-        candidates = payload.get("events")
-        if isinstance(candidates, list):
-            for e in candidates:
-                if isinstance(e, dict):
-                    out.append(e)
-    for d in _walk_dicts(payload):
-        if "competitors" in d and ("startTime" in d or "lastModified" in d) and (
-            "displayGroups" in d or "markets" in d or "description" in d
-        ):
-            ident = str(d.get("id", id(d)))
-            if ident not in seen:
-                seen.add(ident)
-                out.append(d)
-    return out
-
-
-def _competitor_names(event: Dict[str, Any]) -> Tuple[str, str]:
-    comps = event.get("competitors") or []
-    names = []
-    for c in comps:
-        if isinstance(c, dict):
-            names.append(
-                c.get("name")
-                or c.get("description")
-                or c.get("shortName")
-                or ""
-            )
-    if len(names) >= 2:
-        home = next((c.get("name") or c.get("description") or c.get("shortName") for c in comps if c.get("home") is True), None)
-        away = next((c.get("name") or c.get("description") or c.get("shortName") for c in comps if c.get("home") is False), None)
-        if home and away:
-            return str(home), str(away)
-        return str(names[0]), str(names[1])
-    desc = str(event.get("description", ""))
-    parts = re.split(r"\s+@\s+|\s+vs\.?\s+|\s+-\s+", desc, maxsplit=1, flags=re.I)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-    return desc, ""
-
-
-def _extract_bovada_markets(event: Dict[str, Any]) -> List[NormalizedMarket]:
-    containers = []
-    if isinstance(event.get("markets"), list):
-        containers.extend(event["markets"])
-    for group in event.get("displayGroups") or []:
-        if not isinstance(group, dict):
-            continue
-        for key in ("markets", "itemList", "items"):
-            val = group.get(key)
-            if isinstance(val, list):
-                containers.extend(val)
-            elif isinstance(val, dict):
-                items = val.get("items")
-                if isinstance(items, list):
-                    containers.extend(items)
-
-    markets = []
-    for c in containers:
-        if not isinstance(c, dict):
-            continue
-        market_name = str(c.get("name") or c.get("description") or c.get("key") or "market")
-        outcomes_raw = c.get("outcomes") or c.get("selections") or c.get("outcomeList")
-        if isinstance(outcomes_raw, dict):
-            outcomes_raw = outcomes_raw.get("items", [])
-        if not isinstance(outcomes_raw, list):
-            if any(k in c for k in ("price", "odds", "americanOdds")):
-                outcomes_raw = [c]
-            else:
-                continue
-        outs = []
-        for o in outcomes_raw:
-            if not isinstance(o, dict):
-                continue
-            name = str(
-                o.get("name")
-                or o.get("description")
-                or o.get("label")
-                or o.get("shortName")
-                or ""
-            )
-            odd = decimal_from_any(
-                o.get("odds")
-                or o.get("price")
-                or o.get("decimalOdds")
-                or o.get("americanOdds")
-                or o.get("american")
-            )
-            if name and odd and odd > 1:
-                outs.append(NormalizedOutcome(selection=name, odds=odd, active=bool(o.get("active", True))))
-        if outs:
-            markets.append(NormalizedMarket(
-                key=stake_market_key(market_name),
-                name=market_name,
-                outcomes=outs,
-            ))
-    return markets
-
-
-class BovadaCollector:
-    """
-    Fortalecido (paso 5 del plan): sesión persistente con cabeceras completas
-    de navegador, backoff exponencial con jitter en vez de sleep fijo, y
-    manejo explícito de 403/429 que marca la fuente como no disponible en
-    lugar de reventar toda la corrida.
-    """
-
-    def __init__(self, client: Optional[HttpClient] = None, base_delay: float = 1.2, max_retries: int = 3):
-        self.client = client or HttpClient()
-        self.client.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            "Referer": "https://www.bovada.lv/sports",
-        })
-        self.base_delay = base_delay
-        self.max_retries = max_retries
-
-    def fetch_league(self, sport_key: str) -> List[NormalizedEvent]:
-        events, _ok = self.fetch_league_checked(sport_key)
-        return events
-
-    def fetch_league_checked(self, sport_key: str) -> Tuple[List[NormalizedEvent], bool]:
-        """Igual que fetch_league, pero además indica si la fuente respondió
-        con éxito (ok=True) aunque haya devuelto 0 eventos, o si falló por
-        bloqueo/timeout (ok=False) — no son el mismo caso: 0 eventos puede
-        ser simplemente que no hay partidos programados ahora mismo."""
-        url = BOVADA_ENDPOINTS.get(sport_key)
-        if not url:
-            return [], True  # liga no registrada, no es una falla de red
-
-        params = {"preMatchOnly": "true", "lang": "en"}
-        payload = None
-        for intento in range(self.max_retries):
-            try:
-                payload = self.client.get_json(url, params=params)
-                break
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                if status in (403, 429):
-                    return [], False
-                if intento < self.max_retries - 1:
-                    time.sleep(self.base_delay * (2 ** intento))
-                else:
-                    return [], False
-            except requests.exceptions.RequestException:
-                if intento < self.max_retries - 1:
-                    time.sleep(self.base_delay * (2 ** intento))
-                else:
-                    return [], False
-
-        if payload is None:
-            return [], False
-
-        events = []
-        for e in _find_event_dicts(payload):
-            home, away = _competitor_names(e)
-            start = parse_dt(e.get("startTime"))
-            markets = _extract_bovada_markets(e)
-            if not markets:
-                continue
-            events.append(NormalizedEvent(
-                event_id=f"bovada:{e.get('id', '')}",
-                source="bovada",
-                sport=sport_key.split("_")[0],
-                league=sport_key,
-                home=home,
-                away=away,
-                start_time=start.isoformat() if start else None,
-                is_live=bool(e.get("live", False)),
-                status=str(e.get("status", "scheduled")),
-                last_update=(parse_dt(e.get("lastModified")) or utc_now()).isoformat(),
-                markets=markets,
-                raw=e,
-            ))
-        time.sleep(self.base_delay)
-        return dedupe_events(events), True
-
-    def fetch_all(self, sport_keys: Optional[Iterable[str]] = None) -> Tuple[List[NormalizedEvent], List[str]]:
-        """Devuelve (eventos, ligas_no_disponibles) — nunca lanza excepción.
-        Una liga solo cuenta como 'no disponible' si la fuente falló
-        (403/429/timeout agotado), NO simplemente porque no tuviera eventos
-        programados en este momento."""
-        keys = list(sport_keys or BOVADA_ENDPOINTS.keys())
-        events: List[NormalizedEvent] = []
-        no_disponibles: List[str] = []
-        for key in keys:
-            found, ok = self.fetch_league_checked(key)
-            if not ok:
-                no_disponibles.append(key)
-            events.extend(found)
-        return dedupe_events(events), no_disponibles
-
-
-# -----------------------------
-# Free-source registry / context
-# -----------------------------
-def sport_family(event: NormalizedEvent) -> str:
-    s = (event.sport or "").lower()
-    if s in ("baseball",):
-        return "mlb"
-    if s in ("basketball",):
-        return "nba"
-    if s in ("american-football", "americanfootball"):
-        return "nfl"
-    if s in ("ice-hockey", "hockey"):
-        return "nhl"
-    if s in ("football", "soccer"):
-        return "soccer"
-    if s in ("tennis",):
-        return "tennis"
-    if s in ("mma",):
-        return "mma"
-    if s in ("boxing",):
-        return "boxing"
-    if s in ("cricket",):
-        return "cricket"
-    if s in ("formula-1", "f1"):
-        return "f1"
-    if s.startswith("esports"):
-        return "esports"
-    return "other"
-
-
-def bovada_key_for_event(event: NormalizedEvent) -> Optional[str]:
-    """Traduce la taxonomía Stake a las claves reales del registro Bovada."""
-    family = sport_family(event)
-    league = (event.league or "").lower().replace("-", "_").split("_")[-1]
-    prefixes = {"mlb": "baseball", "nba": "basketball", "nhl": "icehockey", "nfl": "americanfootball"}
-    key = f"{prefixes.get(family, family)}_{league}"
-    return key if key in BOVADA_ENDPOINTS else None
-
-
-class FreeSourceRegistry:
-    def sources_for(self, event: NormalizedEvent) -> List[str]:
-        return FREE_SOURCES.get(sport_family(event), FREE_SOURCES["other"])
-
-
-# -----------------------------
-# Snapshot / line movement
-# -----------------------------
-def event_to_dict(e: NormalizedEvent) -> Dict[str, Any]:
-    return {
-        "event_id": e.event_id,
-        "source": e.source,
-        "sport": e.sport,
-        "league": e.league,
-        "home": e.home,
-        "away": e.away,
-        "start_time": e.start_time,
-        "is_live": e.is_live,
-        "status": e.status,
-        "last_update": e.last_update,
-        "markets": [
-            {
-                "key": m.key,
-                "name": m.name,
-                "outcomes": [asdict(o) for o in m.outcomes],
-            }
-            for m in e.markets
-        ],
-    }
-
-
-def dedupe_events(events: List[NormalizedEvent]) -> List[NormalizedEvent]:
-    seen = {}
-    for e in events:
-        key = (e.source, e.event_id) if e.event_id else (
-            e.source, e.sport, e.home, e.away, e.start_time
-        )
-        seen[key] = e
-    return list(seen.values())
-
-
-def market_odds(event: NormalizedEvent, preferred=("moneyline", "draw_no_bet")) -> Dict[str, float]:
-    for key in preferred:
-        for m in event.markets:
-            if m.key == key:
-                return {o.selection: o.odds for o in m.outcomes if o.active and o.odds > 1}
-    return {}
-
-
-def snapshot_market_movements(events: List[NormalizedEvent], path: Path) -> Dict[str, Any]:
-    previous = load_json(path, {})
-    current = {}
-    movements = []
-    now = utc_now().isoformat()
-
-    for e in events:
-        odds = market_odds(e)
-        if not odds:
-            continue
-        current[e.event_id] = {
-            "timestamp": now,
-            "home": e.home,
-            "away": e.away,
-            "odds": odds,
-        }
-        prev = previous.get(e.event_id, {})
-        for sel, curr in odds.items():
-            old = (prev.get("odds") or {}).get(sel)
-            if old and curr != old:
-                movements.append({
-                    "event_id": e.event_id,
-                    "match": f"{e.home} vs {e.away}",
-                    "selection": sel,
-                    "old": old,
-                    "new": curr,
-                    "pct": round((curr / old - 1) * 100, 2),
-                    "direction": "up" if curr > old else "down",
-                })
-    save_json(path, current)
-    return {"timestamp": now, "movements": movements}
-
-
-# -----------------------------
-# Matching Stake vs Bovada
-# -----------------------------
-def normalize_name(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\b(fc|cf|sc|bc|club|the)\b", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def name_similarity(a: str, b: str) -> float:
-    ta, tb = set(normalize_name(a).split()), set(normalize_name(b).split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
-def match_event(stake_event: NormalizedEvent, references: List[NormalizedEvent]) -> Optional[NormalizedEvent]:
-    best, best_score = None, 0.0
-    for r in references:
-        if sport_family(stake_event) != sport_family(r):
-            continue
-        direct = (
-            name_similarity(stake_event.home, r.home)
-            + name_similarity(stake_event.away, r.away)
-        ) / 2.0
-        swapped = (
-            name_similarity(stake_event.home, r.away)
-            + name_similarity(stake_event.away, r.home)
-        ) / 2.0
-        score = max(direct, swapped)
-        if stake_event.start_time and r.start_time:
-            a, b = parse_dt(stake_event.start_time), parse_dt(r.start_time)
-            if a and b:
-                minutes = abs((a - b).total_seconds()) / 60
-                if minutes <= 90:
-                    score += 0.25
-                elif minutes > 720:
-                    score -= 0.25
-        if score > best_score:
-            best_score, best = score, r
-    return best if best_score >= 0.35 else None
-
-
-# -----------------------------
-# Elo internal model
-# -----------------------------
-ELO_INITIAL = 1500.0
-ELO_K = 20.0
-ELO_HOME = 50.0
-ELO_MIN_GAMES = 5
-BRIER_MAX = 0.23
-BRIER_MIN = 8
-
-
-class EloModel:
-    def __init__(self, path: Path = ELO_FILE):
-        self.path = path
-        self.state = load_json(path, {"ratings": {}, "brier": {}})
-
-    @staticmethod
-    def probability(home_elo: float, away_elo: float) -> float:
-        return 1 / (1 + 10 ** ((away_elo - (home_elo + ELO_HOME)) / 400))
-
-    def probability_for(self, sport: str, home: str, away: str) -> Optional[float]:
-        ratings = self.state.get("ratings", {}).get(sport, {})
-        h, a = ratings.get(home), ratings.get(away)
-        if not h or not a:
-            return None
-        if h.get("games", 0) < ELO_MIN_GAMES or a.get("games", 0) < ELO_MIN_GAMES:
-            return None
-        hist = self.state.get("brier", {}).get(sport, [])
-        if len(hist) < BRIER_MIN:
-            return None
-        brier = sum((x["p"] - x["y"]) ** 2 for x in hist) / len(hist)
-        if brier > BRIER_MAX:
-            return None
-        return self.probability(float(h["elo"]), float(a["elo"]))
-
-    def update(self, sport: str, home: str, away: str, home_win: float, game_id: str) -> None:
-        ratings = self.state.setdefault("ratings", {}).setdefault(sport, {})
-        processed = self.state.setdefault("processed", {}).setdefault(sport, [])
-        if game_id in processed:
-            return
-        h = ratings.setdefault(home, {"elo": ELO_INITIAL, "games": 0})
-        a = ratings.setdefault(away, {"elo": ELO_INITIAL, "games": 0})
-        p = self.probability(h["elo"], a["elo"])
-        h["elo"] += ELO_K * (home_win - p)
-        a["elo"] += ELO_K * ((1 - home_win) - (1 - p))
-        h["games"] += 1
-        a["games"] += 1
-        self.state.setdefault("brier", {}).setdefault(sport, []).append({"p": p, "y": home_win})
-        processed.append(game_id)
-
-    def save(self):
-        save_json(self.path, self.state)
-
-
-# -----------------------------
-# Promotions
-# -----------------------------
-def load_promotions() -> List[Dict[str, Any]]:
-    return load_json(PROMOTIONS_FILE, [])
-
-
-def save_promotions(items: List[Dict[str, Any]]) -> None:
-    save_json(PROMOTIONS_FILE, items)
-
-
-def effective_odds(base_odds: float, promotion: Optional[Dict[str, Any]]) -> Tuple[float, str]:
-    if not promotion:
-        return base_odds, "sin promoción"
-    kind = promotion.get("type")
-    if kind == "odds_boost":
-        boost = float(promotion.get("boost_percent", 0))
-        return round(1.0 + (base_odds - 1.0) * (1 + boost / 100), 4), f"Odds Boost +{boost:.1f}%"
-    return base_odds, str(promotion.get("name", "promoción no modelada"))
-
-
-def promo_expected_value(prob: float, base_odds: float, promotion: Optional[Dict[str, Any]]) -> Tuple[float, float, str]:
-    if not promotion:
-        return base_odds, ev_decimal(prob, base_odds), "sin promoción"
-
-    kind = promotion.get("type")
-    if kind == "odds_boost":
-        odds, label = effective_odds(base_odds, promotion)
-        return odds, ev_decimal(prob, odds), label
-
-    if kind in ("refund", "insurance"):
-        refund_fraction = float(promotion.get("refund_fraction", 1.0))
-        trigger_prob = float(promotion.get("trigger_probability", 0.0))
-        p_loss = 1 - prob
-        ev = prob * (base_odds - 1) + p_loss * trigger_prob * refund_fraction - p_loss
-        return base_odds, ev, f"{promotion.get('name', 'Refund/Insurance')}"
-
-    return base_odds, ev_decimal(prob, base_odds), "promoción no modelada; EV base"
-
-
-# -----------------------------
-# Blindado engine
-# -----------------------------
-@dataclass
-class Candidate:
-    event: NormalizedEvent
-    selection: str
-    stake_odds: float
-    model_prob: float
-    reference_prob: Optional[float]
-    ev: float
-    confidence: float
-    promotion: Optional[Dict[str, Any]]
-    effective_odds: float
-    reason: str
-
-
-class BlindadoEngine:
-    MIN_ODDS = 1.40
-    MAX_ODDS = 2.00
-    MIN_EV = 0.04
-    MAX_DIVERGENCE = 0.09
-    MIN_CONFIDENCE = 8.0
-
-    def __init__(self, bankroll: float = 100.0):
-        self.bankroll = bankroll
-
-    def _confidence(
-        self,
-        ev: float,
-        reference_prob: Optional[float],
-        model_prob: float,
-        has_bovada: bool,
-        has_stats: bool,
-        movement_ok: bool,
-    ) -> float:
-        score = 5.0
-        if ev >= 0.08:
-            score += 2
-        elif ev >= 0.04:
-            score += 1
-        if reference_prob is not None:
-            div = abs(model_prob - reference_prob)
-            if div <= 0.03:
-                score += 1
-            elif div > 0.07:
-                score -= 1
-        if has_bovada:
-            score += 0.5
-        if has_stats:
-            score += 1
-        if movement_ok:
-            score += 0.5
-        return max(0.0, min(10.0, score))
-
-    def evaluate_event(
-        self,
-        event: NormalizedEvent,
-        model_probs: Dict[str, float],
-        bovada_event: Optional[NormalizedEvent] = None,
-        promotions: Optional[List[Dict[str, Any]]] = None,
-        stats_verified: bool = False,
-        movement_ok: bool = True,
-    ) -> List[Candidate]:
-        market = next((m for m in event.markets if m.key in ("moneyline", "draw_no_bet")), None)
-        if not market:
-            return []
-
-        ref_odds = market_odds(bovada_event) if bovada_event else {}
-        ref_probs = devig(ref_odds)
-
-        out = []
-        for o in market.outcomes:
-            if not o.active or not (self.MIN_ODDS <= o.odds <= self.MAX_ODDS):
-                continue
-            p = model_probs.get(o.selection)
-            if p is None or not (0 < p < 1):
-                continue
-
-            promo = select_promotion(event, o.selection, promotions or [])
-            eff_odds, ev, promo_label = promo_expected_value(p, o.odds, promo)
-            if not (self.MIN_ODDS <= eff_odds <= self.MAX_ODDS):
-                continue
-            if ev < self.MIN_EV:
-                continue
-
-            ref_name = max(ref_probs, key=lambda x: name_similarity(o.selection, x), default="")
-            ref_p = ref_probs.get(ref_name) if name_similarity(o.selection, ref_name) >= 0.5 else None
-            if ref_p is not None and abs(p - ref_p) > self.MAX_DIVERGENCE:
-                continue
-
-            conf = self._confidence(
-                ev, ref_p, p, bool(bovada_event), stats_verified, movement_ok
-            )
-            if conf < self.MIN_CONFIDENCE:
-                continue
-
-            out.append(Candidate(
-                event=event,
-                selection=o.selection,
-                stake_odds=o.odds,
-                model_prob=p,
-                reference_prob=ref_p,
-                ev=ev,
-                confidence=conf,
-                promotion=promo,
-                effective_odds=eff_odds,
-                reason=promo_label,
-            ))
-        return out
-
-    def choose_one(self, candidates: List[Candidate]) -> Optional[Candidate]:
-        if not candidates:
-            return None
-        return sorted(candidates, key=lambda c: (c.confidence, c.ev), reverse=True)[0]
-
-
-def select_promotion(event: NormalizedEvent, selection: str, promotions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    now = utc_now()
-    for p in promotions:
-        if not p.get("enabled", True):
-            continue
-        exp = parse_dt(p.get("expires_at"))
-        if exp and exp < now:
-            continue
-        if p.get("event_id") and p["event_id"] != event.event_id:
-            continue
-        if p.get("selection") and normalize_name(p["selection"]) != normalize_name(selection):
-            continue
-        return p
-    return None
-
-
-# -----------------------------
-# Model helpers
-# -----------------------------
-def model_from_market_consensus(stake_event: NormalizedEvent, bovada_event: Optional[NormalizedEvent]) -> Dict[str, float]:
-    stake_odds = market_odds(stake_event)
-    stake_p = devig(stake_odds)
-    if bovada_event:
-        bovada_p = devig(market_odds(bovada_event))
-        combined = {}
-        for n, stake_prob in stake_p.items():
-            ref_name = max(bovada_p, key=lambda x: name_similarity(n, x), default="")
-            ref_prob = bovada_p.get(ref_name) if name_similarity(n, ref_name) >= 0.5 else None
-            vals = [p for p in (stake_prob, ref_prob) if p is not None]
-            if vals:
-                combined[n] = sum(vals) / len(vals)
-        total = sum(combined.values())
-        if total:
-            return {k: v / total for k, v in combined.items()}
-    return stake_p
-
-
-def select_reference_model(
-    event: NormalizedEvent,
-    elo: EloModel,
-    bovada_event: Optional[NormalizedEvent],
-) -> Tuple[Dict[str, float], str, bool]:
-    # El Elo actual es binario y no modela el empate; no puede usarse como
-    # distribución 1X2 de fútbol.
-    p_home = None if sport_family(event) == "soccer" else elo.probability_for(event.sport, event.home, event.away)
-    if p_home is not None:
-        return {
-            event.home: p_home,
-            event.away: 1 - p_home,
-        }, "Elo interno calibrado", True
-
-    if bovada_event:
-        probs = model_from_market_consensus(event, bovada_event)
-        return probs, "Referencia de mercado Stake+Bovada (NO modelo estadístico independiente)", False
-
-    return {}, "sin segundo modelo", False
-
-
-# -----------------------------
-# Candidate preparation
-# -----------------------------
-def prepare_candidates(
-    stake_events: List[NormalizedEvent],
-    bovada_events: List[NormalizedEvent],
-    promotions: List[Dict[str, Any]],
-    bankroll: float,
-) -> Tuple[List[Candidate], Dict[str, int]]:
-    engine = BlindadoEngine(bankroll)
-    elo = EloModel()
-    stats = FreeSourceRegistry()
-    candidates = []
-    counts = {
-        "stake_events": len(stake_events),
-        "no_market": 0,
-        "no_model": 0,
-        "ev_or_divergence": 0,
-        "qualified": 0,
-    }
-
-    for e in stake_events:
-        start = parse_dt(e.start_time)
-        if not start or start <= utc_now() or e.is_live:
-            continue
-        bov = match_event(e, bovada_events)
-        model, model_label, stats_verified = select_reference_model(e, elo, bov)
-        if not model:
-            counts["no_model"] += 1
-            continue
-
-        if sport_family(e) == "soccer":
-            odds = market_odds(e)
-            p_draw = next((p for n, p in devig(odds).items() if normalize_name(n) == "draw"), None)
-            if p_draw is not None and p_draw >= 0.30:
-                if not any(m.key == "draw_no_bet" for m in e.markets):
-                    counts["ev_or_divergence"] += 1
-                    continue
-
-        before = len(candidates)
-        cs = engine.evaluate_event(
-            e,
-            model,
-            bovada_event=bov,
-            promotions=promotions,
-            stats_verified=stats_verified,
-            movement_ok=True,
-        )
-        if not cs:
-            counts["ev_or_divergence"] += 1
-        candidates.extend(cs)
-        if len(candidates) > before:
-            counts["qualified"] += len(candidates) - before
-
-    return candidates, counts
-
-
-# -----------------------------
-# UI / reports
-# -----------------------------
-def candidate_report(c: Candidate, bankroll: float) -> Dict[str, Any]:
-    stake = stake_amount(bankroll, c.model_prob, c.effective_odds)
-    return {
-        "PICK": f"{c.event.home} vs {c.event.away}",
-        "Mercado": c.selection,
-        "Stake odds": round(c.stake_odds, 3),
-        "Odds efectivas": round(c.effective_odds, 3),
-        "Prob. modelo": round(c.model_prob * 100, 2),
-        "Prob. referencia": None if c.reference_prob is None else round(c.reference_prob * 100, 2),
-        "EV %": round(c.ev * 100, 2),
-        "Confianza": round(c.confidence, 1),
-        "Stake sugerido": stake,
-        "Promoción": c.reason,
-        "Fuente mercado": "Stake",
-        "Referencia": "Bovada / Elo interno según disponibilidad",
-    }
-
-
-def build_prompt(events: List[NormalizedEvent], movements: Dict[str, Any]) -> str:
-    payload = []
-    for e in events:
-        payload.append(event_to_dict(e))
-    return (
-        BLINDADO_PROMPT
-        + "\n\nDATOS DE STAKE:\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
-        + "\n\nMOVIMIENTOS:\n"
-        + json.dumps(movements, ensure_ascii=False, indent=2)
-    )
-
-
-def init_promotions_file():
-    if not PROMOTIONS_FILE.exists():
-        save_promotions([])
-
-
-def config_value(name: str, default: str = "") -> str:
-    """Lee primero Streamlit Secrets y luego variables de entorno."""
-    try:
-        value = st.secrets.get(name, "")
     except Exception:
-        value = ""
-    return str(value or os.environ.get(name, default) or default)
+        return []
 
 
-def load_remote_snapshot_fallback(
-    selected: Iterable[str],
-    snapshot_repo: str,
-    snapshot_path: str,
-    snapshot_branch: str,
-) -> Tuple[List[NormalizedEvent], List[NormalizedEvent], List[str], Dict[str, Any]]:
-    """Carga el contrato de snapshot anterior sin alterar sus límites de seguridad."""
-    if not snapshot_repo:
-        raise ValueError("No hay SNAPSHOT_REPO configurado para usar el respaldo.")
-    from cloud_snapshot_reader import (
-        obtener_snapshot_remoto,
-        render_estado_snapshot,
-        snapshot_a_normalized_events,
-        snapshot_antiguedad_minutos,
-    )
+def actualizar_elo_sport(api_key, sport_key, estado):
+    """Descarga resultados reales y actualiza ratings + historial de Brier
+    IN-PLACE sobre `estado`. Evita reprocesar el mismo partido dos veces."""
+    resultados = obtener_scores_api(api_key, sport_key)
+    if not resultados:
+        return estado
 
-    snapshot = obtener_snapshot_remoto(
-        snapshot_repo,
-        snapshot_path,
-        snapshot_branch,
-        token=config_value("SNAPSHOT_GITHUB_TOKEN"),
-    )
-    render_estado_snapshot(snapshot)
-    age = snapshot_antiguedad_minutos(snapshot)
-    if age > 60:
-        raise ValueError("Snapshot vencido (>60 min). No se habilita el análisis.")
-    stake_events, bovada_events = snapshot_a_normalized_events(snapshot)
-    selected_set = set(selected)
-    # Compatibilidad con snapshots creados antes de la migración football -> soccer.
-    if "soccer" in selected_set:
-        selected_set.add("football")
-    esports = {"counter-strike", "dota-2", "league-of-legends", "valorant"}
-    if selected_set & esports:
-        selected_set.add("esports")
-    stake_events = [e for e in stake_events if e.sport in selected_set]
-    movement = {
-        "timestamp": snapshot.get("generado_utc"),
-        "movements": snapshot.get("movimientos", []),
-    }
-    return (
-        stake_events,
-        bovada_events,
-        snapshot.get("bovada_no_disponible", []),
-        movement,
-    )
+    ratings = estado["ratings"].setdefault(sport_key, {})
+    procesados = set(estado["procesados"].setdefault(sport_key, []))
+    historial = estado["historial_brier"].setdefault(sport_key, [])
 
+    for evento in resultados:
+        if not isinstance(evento, dict) or not evento.get("completed"):
+            continue
+        game_id = evento.get("id")
+        if not game_id or game_id in procesados:
+            continue
 
-def main():
-    st.set_page_config(page_title="Blindado v5 — Stake First", layout="wide")
-    st.title("🎯 Blindado v5 — Stake First / Fuentes Gratuitas")
-    st.caption(
-        "Sin The Odds API · sin API-Sports · Stake = mercado ejecutable · Bovada = referencia · "
-        "fuentes estadísticas públicas = contexto"
-    )
+        home_team = evento.get("home_team")
+        away_team = evento.get("away_team")
+        scores = evento.get("scores")
+        if not home_team or not away_team or not scores:
+            continue
 
-    init_promotions_file()
-
-    with st.sidebar:
-        st.header("Configuración")
-        bankroll = st.number_input("Bankroll USD", min_value=1.0, value=100.0, step=10.0)
-        stake_delay = st.number_input(
-            "Delay entre consultas Stake (seg)", min_value=0.0, value=0.0, step=0.05
-        )
-        stake_workers = st.slider(
-            "Consultas simultáneas Stake", min_value=1, max_value=10, value=6,
-            help="Seis ofrece buen equilibrio entre velocidad y carga sobre la API.",
-        )
-        bovada_enabled = st.checkbox("Usar Bovada como referencia", value=True)
-        selected = st.multiselect(
-            "Deportes Stake",
-            STAKE_SPORT_SLUGS,
-            default=STAKE_SPORT_SLUGS,
-        )
-        data_source = st.radio(
-            "Fuente de datos",
-            ["API oficial + respaldo automático", "Snapshot remoto"],
-            index=0,
-            help=(
-                "La API oficial es la fuente principal. Si falla por completo, la app intenta "
-                "el snapshot remoto configurado."
-            ),
-        )
-        snapshot_repo = config_value("SNAPSHOT_REPO")
-        snapshot_path = config_value("SNAPSHOT_PATH", "snapshot.json")
-        snapshot_branch = config_value("SNAPSHOT_BRANCH", "main")
-
-        st.divider()
-        st.subheader("Promociones Stake")
-        st.caption("Se cargan desde state/promotions.json. No se asumen promociones universales.")
-        if st.button("Recargar promociones"):
-            st.rerun()
-
-        promotions = load_promotions()
-        st.write(f"Promociones activas configuradas: **{len(promotions)}**")
-
-        with st.expander("Añadir Odds Boost"):
-            event_id = st.text_input("Event ID (opcional)", key="promo_event")
-            selection = st.text_input("Selección (opcional)", key="promo_selection")
-            boost = st.number_input("Boost %", min_value=0.0, value=10.0, step=0.5)
-            if st.button("Guardar boost"):
-                promotions.append({
-                    "enabled": True,
-                    "type": "odds_boost",
-                    "name": f"Stake Odds Boost +{boost}%",
-                    "event_id": event_id or None,
-                    "selection": selection or None,
-                    "boost_percent": boost,
-                })
-                save_promotions(promotions)
-                st.success("Boost guardado.")
-
-        with st.expander("Añadir Refund/Insurance"):
-            r_event = st.text_input("Event ID", key="refund_event")
-            r_selection = st.text_input("Selección", key="refund_selection")
-            r_name = st.text_input("Nombre", value="Stake Refund/Insurance")
-            r_trigger = st.number_input(
-                "Probabilidad del trigger de refund (0-1)",
-                min_value=0.0, max_value=1.0, value=0.10, step=0.01
-            )
-            r_fraction = st.number_input(
-                "Fracción del stake reembolsada",
-                min_value=0.0, max_value=1.0, value=1.0, step=0.05
-            )
-            if st.button("Guardar refund"):
-                promotions.append({
-                    "enabled": True,
-                    "type": "refund",
-                    "name": r_name,
-                    "event_id": r_event or None,
-                    "selection": r_selection or None,
-                    "trigger_probability": r_trigger,
-                    "refund_fraction": r_fraction,
-                })
-                save_promotions(promotions)
-                st.success("Refund guardado.")
-
-        st.divider()
-        st.write("### Fuentes gratuitas")
-        fams = sorted(set(FREE_SOURCES.keys()))
-        st.write(", ".join(fams))
-
-    if st.button("🚀 Actualizar datos deportivos", type="primary"):
-        no_disponibles = []
         try:
-            if data_source == "Snapshot remoto":
-                with st.spinner("Descargando snapshot verificado..."):
-                    stake_events, bovada_events, no_disponibles, movement = (
-                        load_remote_snapshot_fallback(
-                            selected, snapshot_repo, snapshot_path, snapshot_branch
+            score_home = next(float(s["score"]) for s in scores if s.get("name") == home_team)
+            score_away = next(float(s["score"]) for s in scores if s.get("name") == away_team)
+        except (StopIteration, ValueError, TypeError, KeyError):
+            continue
+
+        if score_home == score_away:
+            resultado_home = 0.5
+        else:
+            resultado_home = 1.0 if score_home > score_away else 0.0
+
+        home = ratings.setdefault(home_team, {"elo": ELO_INICIAL, "partidos": 0})
+        away = ratings.setdefault(away_team, {"elo": ELO_INICIAL, "partidos": 0})
+
+        prob_home_pre = _prob_elo(home["elo"] + ELO_VENTAJA_LOCAL, away["elo"])
+
+        home["elo"] += ELO_K_FACTOR * (resultado_home - prob_home_pre)
+        away["elo"] += ELO_K_FACTOR * ((1 - resultado_home) - (1 - prob_home_pre))
+        home["partidos"] += 1
+        away["partidos"] += 1
+
+        historial.append({"prob": prob_home_pre, "resultado": resultado_home})
+        procesados.add(game_id)
+
+    estado["procesados"][sport_key] = list(procesados)
+    return estado
+
+
+def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
+    """Devuelve la entrada de registry basada en Elo interno SOLO si hay
+    suficiente historial calificado y calibración aceptable. Si no, devuelve
+    None (el llamador debe entonces dejarlo como 'pendiente_desarrollo')."""
+    ratings = estado.get("ratings", {}).get(sport_key, {})
+    home = ratings.get(home_team)
+    away = ratings.get(away_team)
+    historial = estado.get("historial_brier", {}).get(sport_key, [])
+    brier = calcular_brier(historial)
+
+    calidad_suficiente = (
+        home is not None and away is not None
+        and home["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
+        and away["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
+        and brier is not None
+        and len(historial) >= ELO_MIN_MUESTRAS_BRIER
+        and brier <= ELO_BRIER_MAXIMO_ACEPTABLE
+    )
+    if not calidad_suficiente:
+        return None
+
+    prob_home = _prob_elo(home["elo"] + ELO_VENTAJA_LOCAL, away["elo"])
+    return {
+        "fuente_primaria": "Modelo Elo interno (backend, calculado desde resultados reales vía Odds API /scores)",
+        "fuente_secundaria": None,
+        "cobertura": "modelo_interno_elo",
+        "version": "1.0",
+        "ultima_revision": REGISTRY_ULTIMA_REVISION,
+        "probabilidad_elo_home": round(prob_home, 4),
+        "elo_home": round(home["elo"], 1),
+        "elo_away": round(away["elo"], 1),
+        "partidos_calificados_home": home["partidos"],
+        "partidos_calificados_away": away["partidos"],
+        "brier_score_historico": round(brier, 4),
+        "muestras_brier": len(historial),
+    }
+
+
+def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
+    """Punto único de verdad para el segundo modelo de un evento: primero mira
+    el registry estático; si ese deporte está marcado para usar Elo interno y
+    hay suficiente calidad, lo reemplaza por la entrada calculada."""
+    base = _buscar_base_registry(sport_key)
+
+    # --- NUEVO v3.4.2: soccer intenta resolverse por ClubElo-backend antes
+    # de usar la entrada estática (elofootball.com). Si el backend no pudo
+    # (paquete no instalado, api.clubelo.com caída, o no encontró alguno de
+    # los dos equipos por nombre), sigue de largo con el registry normal. ---
+    if sport_key and sport_key.lower().startswith("soccer") and home_team and away_team:
+        resuelto_por_backend = obtener_entrada_clubelo_backend(home_team, away_team)
+        if resuelto_por_backend:
+            return resuelto_por_backend
+
+    if (
+        base.get("usa_elo_interno")
+        and base["cobertura"] == "pendiente_desarrollo"
+        and estado_elo is not None
+        and home_team and away_team
+    ):
+        interno = obtener_entrada_modelo_interno(estado_elo, sport_key, home_team, away_team)
+        if interno:
+            return interno
+        ratings = estado_elo.get("ratings", {}).get(sport_key, {})
+        partidos_home = ratings.get(home_team, {}).get("partidos", 0)
+        partidos_away = ratings.get(away_team, {}).get("partidos", 0)
+        base["nota"] = (
+            f"Motor Elo interno activo pero con historial insuficiente todavía "
+            f"({home_team}: {partidos_home} partidos, {away_team}: {partidos_away} partidos, "
+            f"mínimo requerido: {ELO_MIN_PARTIDOS_POR_EQUIPO}). Se acumula automáticamente "
+            f"con cada corrida del sistema."
+        )
+
+    base["ultima_revision"] = REGISTRY_ULTIMA_REVISION
+    return base
+
+
+# ==============================================================================
+# 1d. MOTOR CLUBELO POR BACKEND (soccerdata) — NUEVO v3.4.2
+#
+#     POR QUÉ EXISTE: la IA solo tiene una herramienta real, `web_search`.
+#     "soccerdata" es una librería Python — pedirle a la IA que la "busque"
+#     como si fuera un sitio web no tiene ningún efecto útil. La solución
+#     correcta es que el propio backend descargue los ratings de ClubElo
+#     (vía soccerdata, que internamente pega a api.clubelo.com) ANTES de
+#     armar el prompt, y calcule la probabilidad de resultado él mismo —
+#     exactamente el mismo patrón que ya usa el motor Elo interno para
+#     KBO/NPB/MMA (sección 1c), solo que aquí el rating no se calcula desde
+#     cero: se DESCARGA de ClubElo.
+#
+#     SI FALLA (api.clubelo.com no responde desde tu servidor, o no se
+#     encuentra alguno de los dos equipos por nombre tras el match exacto +
+#     fuzzy): esta función devuelve None, y `obtener_entrada_registry()` cae
+#     de vuelta a la entrada estática del registry para "soccer"
+#     (fuente_primaria = elofootball.com), que sí es un sitio navegable para
+#     que la IA lo busque por su cuenta.
+#
+#     REQUISITO: pip install soccerdata (y sus dependencias: pandas, etc.).
+#     Si el paquete no está instalado, `_SOCCERDATA_DISPONIBLE` queda en
+#     False y esta sección se salta por completo sin romper nada más.
+# ==============================================================================
+
+CLUBELO_VENTAJA_LOCAL = 60.0  # ventaja de local aprox. en puntos Elo (documentada por ClubElo)
+CLUBELO_CACHE_TTL_SEGUNDOS = 6 * 3600  # ClubElo recalcula por jornada, no por minuto
+CLUBELO_JACCARD_MINIMO = 0.5  # umbral mínimo de similitud para aceptar un match fuzzy de nombre
+
+
+@st.cache_data(ttl=CLUBELO_CACHE_TTL_SEGUNDOS, show_spinner=False)
+def _descargar_ranking_clubelo(fecha_iso):
+    """Descarga el ranking ClubElo completo para una fecha (YYYY-MM-DD) usando
+    soccerdata. Devuelve un DataFrame de pandas, o None si el paquete no está
+    instalado o la descarga falla (red, api.clubelo.com caída, etc.).
+    Cacheado varias horas: ClubElo no recalcula en tiempo real, solo tras
+    cada jornada jugada."""
+    if not _SOCCERDATA_DISPONIBLE:
+        return None
+    try:
+        elo = sd.ClubElo()
+        return elo.read_by_date(fecha_iso)
+    except Exception:
+        return None
+
+
+def _buscar_elo_equipo(df_ranking, nombre_equipo):
+    """Busca un equipo en el ranking de ClubElo. Primero intenta match exacto
+    (case-insensitive); si no hay, cae a fuzzy por Jaccard de tokens — mismo
+    enfoque que ya usa el resto de Blindado para nombres de equipo que no
+    coinciden letra por letra entre The Odds API y la fuente externa (ej.
+    acentos, sufijos de ciudad, abreviaciones)."""
+    if df_ranking is None or getattr(df_ranking, "empty", True) or not nombre_equipo:
+        return None
+
+    columnas = list(df_ranking.columns)
+    columna_club = "team" if "team" in columnas else "Club" if "Club" in columnas else columnas[0]
+    columna_elo = "elo" if "elo" in columnas else "Elo" if "Elo" in columnas else None
+    if columna_elo is None:
+        return None
+
+    exacto = df_ranking[df_ranking[columna_club].astype(str).str.lower() == nombre_equipo.lower()]
+    if not exacto.empty:
+        return float(exacto.iloc[0][columna_elo])
+
+    tokens_buscado = set(nombre_equipo.lower().split())
+    mejor_score, mejor_elo = 0.0, None
+    for _, fila in df_ranking.iterrows():
+        tokens_candidato = set(str(fila[columna_club]).lower().split())
+        union = tokens_buscado | tokens_candidato
+        if not union:
+            continue
+        score = len(tokens_buscado & tokens_candidato) / len(union)
+        if score > mejor_score:
+            mejor_score, mejor_elo = score, float(fila[columna_elo])
+
+    return mejor_elo if mejor_score >= CLUBELO_JACCARD_MINIMO else None
+
+
+def obtener_entrada_clubelo_backend(home_team, away_team):
+    """Intenta resolver el segundo modelo de un evento de soccer usando
+    ClubElo vía soccerdata, 100% calculado en el backend, sin gastar tokens
+    de búsqueda de la IA. Devuelve una entrada de registry lista para usar
+    (cobertura 'modelo_interno_elo'), o None si no se pudo resolver — en ese
+    caso el llamador debe caer a la entrada estática del registry
+    (elofootball.com) para que la IA lo busque."""
+    if not _SOCCERDATA_DISPONIBLE or not home_team or not away_team:
+        return None
+
+    fecha_hoy = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    df_ranking = _descargar_ranking_clubelo(fecha_hoy)
+    if df_ranking is None:
+        return None
+
+    elo_home = _buscar_elo_equipo(df_ranking, home_team)
+    elo_away = _buscar_elo_equipo(df_ranking, away_team)
+    if elo_home is None or elo_away is None:
+        return None
+
+    prob_home = _prob_elo(elo_home + CLUBELO_VENTAJA_LOCAL, elo_away)
+
+    return {
+        "fuente_primaria": (
+            "ClubElo (resuelto por el backend vía soccerdata/api.clubelo.com "
+            "— sin búsqueda de IA)"
+        ),
+        "fuente_secundaria": None,
+        "cobertura": "modelo_interno_elo",
+        "version": "1.0",
+        "ultima_revision": REGISTRY_ULTIMA_REVISION,
+        "probabilidad_elo_home": round(prob_home, 4),
+        "elo_home": round(elo_home, 1),
+        "elo_away": round(elo_away, 1),
+        "nota": (
+            f"Elo tomado directamente de ClubElo (fecha {fecha_hoy}), sin "
+            f"muestras/Brier propio — es el rating oficial de la fuente, no "
+            f"un modelo entrenado por Blindado."
+        ),
+    }
+
+
+# ==============================================================================
+# 2. FUNCIONES BACKEND — The Odds API (cuotas)
+# ==============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_deportes_activos(api_key):
+    """Lista de deportes activos hoy. Cacheado 1h: esto casi no cambia en el día."""
+    url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 401:
+            st.error("❌ API Key de The Odds API inválida o vencida.")
+            return []
+        if response.status_code == 429:
+            st.error("❌ Límite de requests alcanzado en The Odds API (429).")
+            return []
+        response.raise_for_status()
+        return [s for s in response.json() if s.get("active") and not s.get("has_outrights")]
+    except Exception as e:
+        st.error(f"Error al obtener deportes desde la API: {e}")
+        return []
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def obtener_cuotas_api(api_key, sport_key):
+    """
+    Consulta cuotas para un deporte específico.
+    NOTA: no se envía 'regions' junto con 'bookmakers' porque The Odds API
+    ignora 'regions' cuando 'bookmakers' está presente.
+    Cacheado 90s para no quemar cuota si el usuario da clic varias veces seguidas.
+    """
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
+    params = {
+        "apiKey": api_key,
+        "markets": "h2h",
+        "bookmakers": "pinnacle,stake,betonlineag,bet365",
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        restantes = response.headers.get("x-requests-remaining")
+        usados = response.headers.get("x-requests-used")
+        if restantes is not None:
+            st.session_state["odds_api_uso"] = {"restantes": restantes, "usados": usados}
+
+        if response.status_code == 401:
+            st.error(f"❌ API Key inválida al consultar {sport_key}.")
+            return []
+        if response.status_code == 422:
+            return []  # deporte sin mercado h2h disponible, no es un error real
+        if response.status_code == 429:
+            st.warning(f"⚠️ Rate limit alcanzado en {sport_key}, se omite este deporte.")
+            return []
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return []
+
+
+def devig_probabilidades(outcomes):
+    if not outcomes:
+        return {}
+    implicitas = {
+        o["name"]: 1.0 / o["price"]
+        for o in outcomes
+        if isinstance(o, dict) and o.get("price") and o["price"] > 0
+    }
+    overround = sum(implicitas.values())
+    if overround == 0:
+        return {}
+    return {nombre: round(p / overround, 4) for nombre, p in implicitas.items()}
+
+
+def calcular_dispersion_mercado(evento):
+    """Mide la dispersión de probabilidades entre casas de apuestas, tomando el
+    spread máximo encontrado en CUALQUIER resultado del mercado (home, away,
+    draw) — no solo el local."""
+    if not isinstance(evento, dict):
+        return 0.0
+
+    probs_por_resultado = {}
+    for b in evento.get("bookmakers", []):
+        if not isinstance(b, dict):
+            continue
+        h2h = next((m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        if not h2h:
+            continue
+        devig = devig_probabilidades(h2h.get("outcomes", []))
+        for nombre, prob in devig.items():
+            probs_por_resultado.setdefault(nombre, []).append(prob)
+
+    dispersiones = [
+        max(vals) - min(vals) for vals in probs_por_resultado.values() if len(vals) >= 2
+    ]
+    return max(dispersiones) if dispersiones else 0.0
+
+
+def registrar_y_calcular_movimientos(eventos_minificados, deporte_key):
+    if not eventos_minificados:
+        return {}
+    state_key = f"pinnacle_snapshot_{deporte_key}"
+    movimientos = {}
+    snapshot_actual = {}
+
+    for ev in eventos_minificados:
+        if not isinstance(ev, dict):
+            continue
+        ev_id = ev.get("id")
+        matchup = ev.get("partido")
+        prices = ev.get("cuotas_pinnacle", {})
+        if ev_id and prices:
+            snapshot_actual[ev_id] = {"matchup": matchup, "prices": prices}
+
+    if state_key in st.session_state and isinstance(st.session_state[state_key], dict):
+        snapshot_previo = st.session_state[state_key]
+        for ev_id, data_curr in snapshot_actual.items():
+            if ev_id in snapshot_previo:
+                data_prev = snapshot_previo[ev_id]
+                for team, price_curr in data_curr.get("prices", {}).items():
+                    price_prev = data_prev.get("prices", {}).get(team)
+                    if price_prev and price_prev != price_curr:
+                        pct_change = round(((price_curr - price_prev) / price_prev) * 100, 2)
+                        direccion = "subió" if pct_change > 0 else "bajó"
+                        movimientos[f"{data_curr['matchup']} ({team})"] = (
+                            f"Cuota cambió de {price_prev} a {price_curr} ({direccion} {abs(pct_change)}%)"
                         )
+
+    st.session_state[state_key] = snapshot_actual
+    return movimientos
+
+
+def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
+    if not datos_crudos or not isinstance(datos_crudos, list):
+        return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
+
+    eventos_validos = []
+    descartados_sin_pinnacle = 0
+    descartados_fuera_de_rango = 0
+    descartados_fecha = 0
+    descartados_sin_fecha = 0
+    descartados_exclusion_estructural = 0
+    eventos_con_elo_interno = 0
+    eventos_pendientes_desarrollo = 0
+
+    ahora_utc = datetime.now(timezone.utc)
+    limite_utc = ahora_utc + timedelta(hours=horas_ventana)
+
+    for evento in datos_crudos:
+        if not isinstance(evento, dict):
+            continue
+
+        home_team = evento.get("home_team")
+        away_team = evento.get("away_team")
+        registry_entry = obtener_entrada_registry(
+            evento.get("sport_key"), home_team=home_team, away_team=away_team, estado_elo=estado_elo
+        )
+        if registry_entry["cobertura"] == "excluido_estructural":
+            descartados_exclusion_estructural += 1
+            continue
+
+        commence_str = evento.get("commence_time")
+        if not commence_str:
+            descartados_sin_fecha += 1
+            continue
+        try:
+            commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+            if not (ahora_utc <= commence_dt <= limite_utc):
+                descartados_fecha += 1
+                continue
+        except Exception:
+            descartados_sin_fecha += 1
+            continue
+
+        pinnacle = next((b for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key") == "pinnacle"), None)
+        if not pinnacle:
+            descartados_sin_pinnacle += 1
+            continue
+
+        h2h = next((m for m in pinnacle.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        if not h2h:
+            descartados_sin_pinnacle += 1
+            continue
+
+        outcomes = h2h.get("outcomes", [])
+        en_rango = any(1.40 <= o.get("price", 0) <= 2.00 for o in outcomes if isinstance(o, dict))
+        if not en_rango:
+            descartados_fuera_de_rango += 1
+            continue
+
+        pinnacle_devig = devig_probabilidades(outcomes)
+        n_bookmakers = len(evento.get("bookmakers", []))
+        dispersion = calcular_dispersion_mercado(evento)
+
+        if n_bookmakers >= 3 and dispersion < 0.05:
+            liquidez = "Alta"
+        elif n_bookmakers >= 2:
+            liquidez = "Media"
+        else:
+            liquidez = "Media/Baja — evaluar según categoría de liga"
+
+        cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
+
+        if registry_entry["cobertura"] == "modelo_interno_elo":
+            eventos_con_elo_interno += 1
+        elif registry_entry["cobertura"] == "pendiente_desarrollo":
+            eventos_pendientes_desarrollo += 1
+
+        evento_minificado = {
+            "id": evento.get("id"),
+            "deporte": evento.get("sport_title") or evento.get("sport_key"),
+            "sport_key": evento.get("sport_key"),
+            "partido": f"{home_team} vs {away_team}",
+            "inicio_utc": commence_str,
+            "cuotas_pinnacle": cuotas_pinnacle,
+            "_pinnacle_devig": pinnacle_devig,
+            "_pinnacle_last_update": pinnacle.get("last_update"),
+            "_liquidez_backend": liquidez,
+            "_dispersion_max_entre_casas": round(dispersion, 4),
+            "_n_casas_reportando": n_bookmakers,
+            "_registry_modelo_secundario": registry_entry,
+        }
+        eventos_validos.append(evento_minificado)
+
+    resumen_filtro = (
+        f"Backend pre-filtró {len(datos_crudos)} eventos: "
+        f"{len(eventos_validos)} candidatos calificados (prx {horas_ventana}h, cuota 1.40-2.00), "
+        f"{descartados_fecha} descartados por fecha fuera de ventana, "
+        f"{descartados_sin_fecha} descartados por fecha faltante/ilegible, "
+        f"{descartados_sin_pinnacle} descartados sin Pinnacle, "
+        f"{descartados_fuera_de_rango} descartados fuera de rango de cuota, "
+        f"{descartados_exclusion_estructural} excluidos estructuralmente (preseason/exhibición). "
+        f"De los {len(eventos_validos)} candidatos: {eventos_con_elo_interno} resueltos por el motor "
+        f"Elo interno (calibrado) y {eventos_pendientes_desarrollo} siguen sin segundo modelo "
+        f"disponible (la IA los descartará)."
+    )
+    return eventos_validos, resumen_filtro
+
+
+# ==============================================================================
+# 2b. MODO "POR DEPORTE" (nuevo en v3.5)
+#
+#     PROBLEMA QUE RESUELVE: con "TODOS LOS DEPORTES ACTIVOS" en un solo
+#     prompt, el presupuesto de búsqueda de la IA se reparte entre 30-40+
+#     eventos. En la práctica, esto significa que varios eventos con valor
+#     real (EV/divergencia buenos) terminan sin verificar simplemente porque
+#     la IA se quedó sin tiempo/tokens antes de llegar a ellos — no porque
+#     hayan fallado ningún umbral. Este modo divide el trabajo en varios
+#     prompts más pequeños, uno por familia de deporte, para que cada evento
+#     reciba una búsqueda real.
+#
+#     BONUS DE EFICIENCIA: los eventos con cobertura "pendiente_desarrollo" o
+#     "excluido_estructural" NUNCA necesitan que la IA busque nada — el
+#     resultado ya es 100% determinístico. Este modo los separa y genera su
+#     resumen directamente en código, con CERO tokens de IA gastados en ellos.
+# ==============================================================================
+
+def familia_deporte(sport_key):
+    """Agrupa eventos en familias amplias usando el prefijo del sport_key de
+    The Odds API (ej. 'soccer_belgium_first_div' -> 'soccer',
+    'baseball_mlb' -> 'baseball'). Sirve para dividir un prompt gigante en
+    varios prompts manejables, uno por familia."""
+    if not sport_key:
+        return "otros"
+    return sport_key.split("_")[0]
+
+
+def agrupar_eventos_por_familia(eventos):
+    grupos = {}
+    for ev in eventos:
+        familia = familia_deporte(ev.get("sport_key"))
+        grupos.setdefault(familia, []).append(ev)
+    return grupos
+
+
+def separar_ia_vs_automatico(eventos_familia):
+    """Divide los eventos de una familia entre los que SÍ necesitan que la IA
+    busque y analice ('externa_directa', 'modelo_interno_elo') y los que ya
+    son descarte 100% determinístico por reglas del backend
+    ('pendiente_desarrollo', 'excluido_estructural'). Estos últimos NUNCA
+    necesitan gastar tokens de IA — el resultado ya se sabe de antemano."""
+    necesita_ia, automaticos = [], []
+    for ev in eventos_familia:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        if cobertura in ("pendiente_desarrollo", "excluido_estructural"):
+            automaticos.append(ev)
+        else:
+            necesita_ia.append(ev)
+    return necesita_ia, automaticos
+
+
+def resumen_automatico_grupo(familia, eventos_automaticos):
+    """Genera, SIN usar IA, el resumen de descarte para eventos ya
+    determinísticos (categoría 2) — ahorra el 100% de los tokens de esos
+    eventos porque el resultado no depende de ninguna búsqueda."""
+    if not eventos_automaticos:
+        return None
+    lineas = [
+        f"**{familia.upper()}** — {len(eventos_automaticos)} evento(s), "
+        f"0 tokens de IA usados (descarte automático, categoría 2):"
+    ]
+    for ev in eventos_automaticos:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        lineas.append(f"- {ev.get('partido')} ({ev.get('deporte')}) — {cobertura}")
+    return "\n".join(lineas)
+
+
+def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
+    """Arma un prompt scoped a UNA familia de deporte, reutilizando el mismo
+    SYSTEM_PROMPT_BLINDADO_V3_2 (reglas idénticas), pero con el JSON limitado
+    a los eventos de esa familia que sí necesitan verificación de IA."""
+    return (
+        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+        f"==================================================\n"
+        f"CONTEXTO DE EJECUCIÓN DEL BACKEND (MODO POR DEPORTE)\n"
+        f"==================================================\n"
+        f"ÁMBITO GENERAL DE LA CORRIDA: {seleccion_label}\n"
+        f"GRUPO ANALIZADO EN ESTE PROMPT: {familia.upper()} "
+        f"({len(eventos_grupo)} evento(s))\n"
+        f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
+        f"{seccion_movimiento}\n\n"
+        f"NOTA IMPORTANTE: Este prompt contiene ÚNICAMENTE los eventos de la "
+        f"familia '{familia}' que ya pasaron el pre-filtrado de frescura y "
+        f"liquidez y tienen cobertura 'externa_directa' o 'modelo_interno_elo'. "
+        f"Los eventos de esta misma familia con cobertura 'pendiente_desarrollo' "
+        f"o 'excluido_estructural' YA fueron descartados por el backend sin "
+        f"usar IA (ver resumen aparte) — no vienen en este JSON, y por lo "
+        f"tanto NO deben aparecer en tu conteo de categoría 2 de este prompt "
+        f"(ese conteo se reporta aparte, fuera de la IA).\n\n"
+        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
+        f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
+        f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
+        f"de-vig ni filtres por rango nuevamente.\n\n"
+        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS (solo familia '{familia}'):\n"
+        f"{json.dumps(eventos_grupo, indent=2, ensure_ascii=False)}"
+    )
+
+
+def construir_prompts_por_deporte(eventos_filtrados, seleccion_label, hora_rd, seccion_movimiento):
+    """Devuelve (prompts_por_grupo: dict[str, str], resumen_automatico: str).
+    prompts_por_grupo solo incluye familias con al menos 1 evento que
+    necesita IA — las familias 100% automáticas no generan prompt."""
+    grupos = agrupar_eventos_por_familia(eventos_filtrados)
+    prompts_por_grupo = {}
+    resúmenes_automaticos = []
+
+    for familia, eventos_familia in sorted(grupos.items()):
+        necesita_ia, automaticos = separar_ia_vs_automatico(eventos_familia)
+        if automaticos:
+            resumen = resumen_automatico_grupo(familia, automaticos)
+            if resumen:
+                resúmenes_automaticos.append(resumen)
+        if necesita_ia:
+            prompts_por_grupo[familia] = construir_prompt_grupo(
+                familia, necesita_ia, seleccion_label, hora_rd, seccion_movimiento
+            )
+
+    resumen_automatico_total = (
+        "\n\n".join(resúmenes_automaticos)
+        if resúmenes_automaticos
+        else "Ningún evento cayó en descarte 100% automático en esta corrida."
+    )
+    return prompts_por_grupo, resumen_automatico_total
+
+
+# ==============================================================================
+# 3. GEMINI — modelos SIEMPRE consultados en vivo (nunca hardcodeados).
+# ==============================================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def listar_modelos_gemini(gemini_api_key):
+    url = f"{GEMINI_API_BASE}/models?key={gemini_api_key}"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        modelos = r.json().get("models", [])
+        utilizables = []
+        for m in modelos:
+            nombre = m.get("name", "").replace("models/", "")
+            metodos = m.get("supportedGenerationMethods", [])
+            if "generateContent" in metodos and not any(
+                x in nombre for x in ["image", "audio", "tts", "embedding", "live", "vision"]
+            ):
+                utilizables.append(nombre)
+        return sorted(utilizables, reverse=True)
+    except Exception as e:
+        st.error(f"No se pudo obtener la lista de modelos de Gemini: {e}")
+        return []
+
+
+def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
+    """Llamada REST directa. Devuelve también el uso de tokens reportado en
+    'usageMetadata'. Google no expone el saldo/crédito restante de la cuenta
+    por esta vía — eso solo se ve en Google AI Studio / Cloud Console."""
+    url = f"{GEMINI_API_BASE}/models/{modelo}:generateContent"
+    headers = {"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt_texto}]}]}
+    r = requests.post(url, headers=headers, json=body, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    partes = data["candidates"][0]["content"]["parts"]
+    texto = "".join(p.get("text", "") for p in partes)
+    uso = data.get("usageMetadata", {})
+    return texto, uso
+
+
+# ==============================================================================
+# 3b. CLAUDE (Anthropic) — búsqueda web FORZADA vía tool en la propia llamada.
+#     No depende de ningún toggle de interfaz: el tool viaja en el request.
+# ==============================================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def listar_modelos_claude(anthropic_api_key):
+    url = f"{ANTHROPIC_API_BASE}/models"
+    headers = {"x-api-key": anthropic_api_key, "anthropic-version": ANTHROPIC_VERSION}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        modelos = r.json().get("data", [])
+        return [m.get("id") for m in modelos if m.get("id")]
+    except Exception as e:
+        st.error(f"No se pudo obtener la lista de modelos de Claude: {e}")
+        return []
+
+
+def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000):
+    """
+    Llama a la API de Claude con el tool de web_search FORZADO en el propio
+    request — no depende de ningún toggle manual de interfaz.
+
+    Devuelve: (texto, queries_buscadas, uso_tokens, ratelimit)
+    - uso_tokens: tokens consumidos en ESTA llamada (campo 'usage').
+    - ratelimit: headers 'anthropic-ratelimit-*' — son ventanas de tasa
+      (requests/tokens por minuto), NO el saldo en dólares de la cuenta. El
+      saldo prepagado solo se ve en console.anthropic.com → Billing.
+
+    NOTA v3.3/v3.4: con la tabla de transparencia y la sección "casi calificó"
+    activadas, esta llamada puede necesitar bastantes tokens de salida —
+    default subido a 8000. Si notas respuestas cortadas en corridas con
+    "TODOS LOS DEPORTES ACTIVOS" (muchos eventos externa_directa), considera
+    correr por deporte individual en vez de todos a la vez.
+    """
+    url = f"{ANTHROPIC_API_BASE}/messages"
+    headers = {
+        "x-api-key": anthropic_api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    body = {
+        "model": modelo,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt_texto}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+
+    partes_texto = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+    fuentes_buscadas = [
+        b.get("input", {}).get("query")
+        for b in data.get("content", [])
+        if b.get("type") == "server_tool_use" and b.get("name") == "web_search"
+    ]
+    texto_final = "\n\n".join(partes_texto)
+    queries = [q for q in fuentes_buscadas if q]
+
+    uso = data.get("usage", {})
+    ratelimit = {
+        "requests_restantes": r.headers.get("anthropic-ratelimit-requests-remaining"),
+        "tokens_restantes": r.headers.get("anthropic-ratelimit-tokens-remaining"),
+        "tokens_limite": r.headers.get("anthropic-ratelimit-tokens-limit"),
+        "reset": r.headers.get("anthropic-ratelimit-tokens-reset"),
+    }
+    return texto_final, queries, uso, ratelimit
+
+
+# ==============================================================================
+# 4. INTERFAZ
+# ==============================================================================
+
+st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
+st.title("📊 Analista de Apuesta Única v3.5 (Multi-IA, Multi-Deporte, Motor Elo Interno & Modo por Deporte)")
+
+with st.sidebar:
+    st.header("🔑 Configuración de APIs")
+    api_key = st.secrets.get("ODDS_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("Odds API Key:", type="password")
+
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not gemini_api_key:
+        gemini_api_key = st.text_input("Gemini API Key (Opcional):", type="password")
+
+    anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_api_key:
+        anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
+
+    if "odds_api_uso" in st.session_state:
+        uso = st.session_state["odds_api_uso"]
+        st.caption(f"📉 Odds API — usados: {uso['usados']} · restantes: {uso['restantes']}")
+
+    if "gemini_tokens_acumulados" in st.session_state:
+        g = st.session_state["gemini_tokens_acumulados"]
+        st.caption(
+            f"🧮 Gemini (sesión) — prompt: {g['prompt']:,} · salida: {g['salida']:,} · "
+            f"total: {g['total']:,} tokens"
+        )
+        st.caption("Saldo/crédito real: solo visible en Google AI Studio / Cloud Console.")
+
+    if "claude_tokens_acumulados" in st.session_state:
+        c = st.session_state["claude_tokens_acumulados"]
+        st.caption(
+            f"🧮 Claude (sesión) — entrada: {c['entrada']:,} · salida: {c['salida']:,} · "
+            f"total: {c['total']:,} tokens"
+        )
+        if "claude_ratelimit" in st.session_state:
+            rl = st.session_state["claude_ratelimit"]
+            st.caption(
+                f"⏱️ Ventana de rate-limit — tokens restantes: {rl['tokens_restantes']}/"
+                f"{rl['tokens_limite']} · requests restantes: {rl['requests_restantes']}"
+            )
+        st.caption("Saldo/crédito prepagado real: solo visible en console.anthropic.com → Billing.")
+
+    estado_elo_sidebar = cargar_estado_elo()
+    if estado_elo_sidebar.get("ratings"):
+        with st.expander("🧠 Motor Elo interno — estado actual"):
+            for sport_key, ratings in estado_elo_sidebar["ratings"].items():
+                brier = calcular_brier(estado_elo_sidebar.get("historial_brier", {}).get(sport_key, []))
+                n_muestras = len(estado_elo_sidebar.get("historial_brier", {}).get(sport_key, []))
+                brier_txt = f"{brier:.4f}" if brier is not None else "N/A"
+                st.write(f"**{sport_key}** — {len(ratings)} equipos rateados, "
+                         f"Brier: {brier_txt} ({n_muestras} muestras)")
+
+if api_key:
+    deportes_lista = obtener_deportes_activos(api_key)
+
+    if deportes_lista:
+        opciones_deporte = {"🔥 TODOS LOS DEPORTES ACTIVOS": "ALL"}
+        for dep in deportes_lista:
+            opciones_deporte[f"{dep.get('group')} - {dep.get('title')}"] = dep.get('key')
+
+        seleccion = st.selectbox("Selecciona el deporte o ámbito a analizar:", list(opciones_deporte.keys()))
+        deporte_key_seleccionado = opciones_deporte[seleccion]
+
+        modo_ejecucion = st.radio(
+            "Modo de análisis:",
+            ["Todo en un solo prompt (rápido, menos preciso)", "Separado por deporte (más lento, cobertura completa)"],
+            help=(
+                "'Todo en un prompt' es más barato pero, con muchos eventos, la IA puede quedarse sin "
+                "presupuesto de búsqueda antes de verificar todos — algunos con valor real pueden quedar "
+                "sin analizar. 'Separado por deporte' cuesta más tokens en total pero garantiza que cada "
+                "evento reciba una búsqueda real, y no gasta tokens de IA en eventos ya descartables "
+                "automáticamente (CFL, AFL, NRL, KBO, NPB sin historial, etc.)."
+            ),
+        )
+
+        if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
+            with st.spinner("Consultando The Odds API, actualizando motor Elo y procesando pre-filtros..."):
+                datos_acumulados = []
+
+                if deporte_key_seleccionado == "ALL":
+                    progress_bar = st.progress(0)
+                    total_deps = len(deportes_lista)
+                    for idx, dep in enumerate(deportes_lista):
+                        cuotas = obtener_cuotas_api(api_key, dep.get('key'))
+                        if cuotas:
+                            datos_acumulados.extend(cuotas)
+                        progress_bar.progress((idx + 1) / total_deps)
+                        time.sleep(0.15)  # evita ráfaga -> 429
+                    progress_bar.empty()
+                else:
+                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado)
+
+                # --- Actualizar motor Elo interno para los deportes presentes
+                # que están marcados como "usa_elo_interno" en el registry ---
+                estado_elo = cargar_estado_elo()
+                sport_keys_presentes = {ev.get("sport_key") for ev in datos_acumulados if isinstance(ev, dict)}
+                for sk in sport_keys_presentes:
+                    base = _buscar_base_registry(sk)
+                    if base.get("usa_elo_interno"):
+                        estado_elo = actualizar_elo_sport(api_key, sk, estado_elo)
+                guardar_estado_elo(estado_elo)
+
+                tz_rd = timezone(timedelta(hours=-4))
+                hora_rd = datetime.now(tz_rd).strftime("%Y-%m-%d %H:%M:%S AST (UTC-4)")
+
+                eventos_filtrados, resumen_filtro = filtrar_y_enriquecer(datos_acumulados, estado_elo)
+                movimientos_pinnacle = registrar_y_calcular_movimientos(eventos_filtrados, deporte_key_seleccionado)
+
+                seccion_movimiento = "SIN SNAPSHOT PREVIO EN ESTA SESIÓN."
+                if movimientos_pinnacle:
+                    lineas_mov = "\n".join(f"- {k}: {v}" for k, v in movimientos_pinnacle.items())
+                    seccion_movimiento = f"MOVIMIENTOS EN PINNACLE DETECTADOS:\n{lineas_mov}"
+
+                st.write("### 📌 Resumen de Filtrado Backend")
+                st.info(resumen_filtro)
+
+                if not eventos_filtrados:
+                    st.warning("⚠️ No se encontraron candidatos válidos en el rango 1.40 - 2.00 para los partidos de hoy.")
+                elif modo_ejecucion.startswith("Todo en un solo prompt"):
+                    st.session_state.pop("prompts_por_grupo", None)
+                    st.session_state.pop("resumen_automatico_grupo", None)
+                    prompt_completo = (
+                        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+                        f"==================================================\n"
+                        f"CONTEXTO DE EJECUCIÓN DEL BACKEND\n"
+                        f"==================================================\n"
+                        f"ÁMBITO: {seleccion}\n"
+                        f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
+                        f"RESUMEN DE PRE-FILTRADO:\n{resumen_filtro}\n\n"
+                        f"{seccion_movimiento}\n\n"
+                        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
+                        f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
+                        f"`_n_casas_reportando` y `_registry_modelo_secundario`. No recalcules el "
+                        f"de-vig ni filtres por rango nuevamente.\n\n"
+                        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS:\n"
+                        f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
                     )
-            else:
-                stake = StakeSportsDataCollector(
-                    delay=float(stake_delay),
-                    max_workers=int(stake_workers),
-                    api_key=config_value("STAKE_ODDS_API_KEY"),
+                    st.session_state["prompt_generado"] = prompt_completo
+                    st.success(f"✅ Se consolidaron {len(eventos_filtrados)} eventos aptos para el prompt.")
+                else:
+                    st.session_state.pop("prompt_generado", None)
+                    prompts_por_grupo, resumen_auto = construir_prompts_por_deporte(
+                        eventos_filtrados, seleccion, hora_rd, seccion_movimiento
+                    )
+                    st.session_state["prompts_por_grupo"] = prompts_por_grupo
+                    st.session_state["resumen_automatico_grupo"] = resumen_auto
+                    n_grupos = len(prompts_por_grupo)
+                    n_eventos_ia = sum(
+                        p.count('"partido"') for p in prompts_por_grupo.values()
+                    )
+                    st.success(
+                        f"✅ Se armaron {n_grupos} prompt(s) por familia de deporte "
+                        f"({n_eventos_ia} eventos requieren IA). Los descartes 100% "
+                        f"automáticos se resolvieron sin gastar tokens de IA — revísalos abajo."
+                    )
+                    if resumen_auto:
+                        with st.expander("📋 Descartes automáticos (0 tokens de IA)"):
+                            st.markdown(resumen_auto)
+
+    if "prompt_generado" in st.session_state:
+        st.divider()
+        st.subheader("🤖 Selecciona la IA para ejecutar el Análisis")
+        st.caption("Estos botones abren la web de cada IA — pega el prompt y elige tú el modelo más reciente disponible en cada plataforma.")
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.link_button("🌐 ChatGPT", "https://chatgpt.com", use_container_width=True)
+        with col2:
+            st.link_button("🌐 Claude", "https://claude.ai", use_container_width=True)
+        with col3:
+            st.link_button("🌐 Gemini Web", "https://gemini.google.com", use_container_width=True)
+        with col4:
+            st.link_button("🌐 DeepSeek", "https://chat.deepseek.com", use_container_width=True)
+        with col5:
+            st.link_button("🌐 Copilot", "https://copilot.microsoft.com", use_container_width=True)
+
+        st.write("#### 📋 Prompt Listo para Copiar")
+        st.code(st.session_state["prompt_generado"], language="markdown")
+
+        if gemini_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Gemini API)")
+
+            modelos_disponibles = listar_modelos_gemini(gemini_api_key)
+            if modelos_disponibles:
+                modelo_default = next(
+                    (m for m in modelos_disponibles if "flash" in m and "lite" not in m),
+                    modelos_disponibles[0],
                 )
-                bovada = BovadaCollector() if bovada_enabled else None
-                try:
-                    with st.spinner("Consultando la Sports Data API oficial de Stake..."):
-                        stake_events = stake.fetch_all(selected)
-                    if not stake_events:
-                        raise RuntimeError("la API no devolvió eventos con mercados activos")
-                    movement = snapshot_market_movements(stake_events, STAKE_SNAPSHOT_FILE)
-                    bovada_events = []
-                    if bovada_enabled:
-                        leagues = sorted({k for e in stake_events if (k := bovada_key_for_event(e))})
-                        bovada_events, no_disponibles = bovada.fetch_all(leagues)
-                    st.caption("Fuente utilizada: Stake Sports Data API oficial.")
-                except Exception as api_exc:
-                    if not snapshot_repo:
-                        raise RuntimeError(
-                            f"Falló la API oficial ({api_exc}) y no existe SNAPSHOT_REPO de respaldo."
-                        ) from api_exc
-                    st.warning(
-                        f"La API oficial falló ({api_exc}). Activando snapshot remoto de respaldo."
-                    )
-                    with st.spinner("Cargando respaldo verificado..."):
-                        stake_events, bovada_events, no_disponibles, movement = (
-                            load_remote_snapshot_fallback(
-                                selected, snapshot_repo, snapshot_path, snapshot_branch
+                modelo_elegido = st.selectbox(
+                    "Modelo Gemini (lista obtenida en vivo desde la API — siempre actualizada):",
+                    modelos_disponibles,
+                    index=modelos_disponibles.index(modelo_default),
+                )
+                if st.button("🤖 Analizar directamente con Gemini API", type="primary"):
+                    with st.spinner(f"Analizando con {modelo_elegido}..."):
+                        try:
+                            resultado, uso_tokens = llamar_gemini_rest(
+                                gemini_api_key, modelo_elegido, st.session_state["prompt_generado"]
                             )
+                            st.markdown("### 🏆 Resultado del Análisis")
+                            st.markdown(resultado)
+
+                            prev = st.session_state.get(
+                                "gemini_tokens_acumulados", {"prompt": 0, "salida": 0, "total": 0}
+                            )
+                            prev["prompt"] += uso_tokens.get("promptTokenCount", 0) or 0
+                            prev["salida"] += uso_tokens.get("candidatesTokenCount", 0) or 0
+                            prev["total"] += uso_tokens.get("totalTokenCount", 0) or 0
+                            st.session_state["gemini_tokens_acumulados"] = prev
+                            st.caption(
+                                f"Esta llamada: {uso_tokens.get('promptTokenCount', 0):,} tokens de "
+                                f"entrada · {uso_tokens.get('candidatesTokenCount', 0):,} de salida."
+                            )
+                        except Exception as e:
+                            st.error(f"Error al ejecutar con Gemini API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Gemini.")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Claude API — búsqueda forzada)")
+            st.caption(
+                "Esta llamada incluye el tool `web_search` directamente en el request, "
+                "así que Claude SÍ puede buscar en ClubElo/FanGraphs/TennisAbstract "
+                "aunque el toggle de búsqueda en claude.ai estuviera apagado."
+            )
+
+            modelos_claude = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude:
+                modelo_claude_default = next(
+                    (m for m in modelos_claude if "sonnet" in m.lower()), modelos_claude[0]
+                )
+                modelo_claude_elegido = st.selectbox(
+                    "Modelo Claude (lista obtenida en vivo desde la API):",
+                    modelos_claude,
+                    index=modelos_claude.index(modelo_claude_default),
+                )
+                if st.button("🤖 Analizar directamente con Claude API", type="primary"):
+                    with st.spinner(f"Analizando con {modelo_claude_elegido} (con búsqueda web activa)..."):
+                        try:
+                            resultado, queries_buscadas, uso_tokens, ratelimit = llamar_claude_rest(
+                                anthropic_api_key, modelo_claude_elegido, st.session_state["prompt_generado"],
+                                max_tokens=8000,
+                            )
+                            st.markdown("### 🏆 Resultado del Análisis")
+                            st.markdown(resultado)
+                            if queries_buscadas:
+                                with st.expander(f"🔍 Búsquedas web realizadas ({len(queries_buscadas)})"):
+                                    for q in queries_buscadas:
+                                        st.write(f"- {q}")
+                            else:
+                                st.warning(
+                                    "⚠️ Claude no ejecutó ninguna búsqueda web en esta corrida — "
+                                    "revisa el resultado, es posible que haya descartado todo por "
+                                    "falta de datos verificables en vez de fabricarlos."
+                                )
+
+                            entrada_tok = uso_tokens.get("input_tokens", 0) or 0
+                            salida_tok = uso_tokens.get("output_tokens", 0) or 0
+                            prev = st.session_state.get(
+                                "claude_tokens_acumulados", {"entrada": 0, "salida": 0, "total": 0}
+                            )
+                            prev["entrada"] += entrada_tok
+                            prev["salida"] += salida_tok
+                            prev["total"] += entrada_tok + salida_tok
+                            st.session_state["claude_tokens_acumulados"] = prev
+                            st.session_state["claude_ratelimit"] = ratelimit
+                            st.caption(f"Esta llamada: {entrada_tok:,} tokens de entrada · {salida_tok:,} de salida.")
+                        except Exception as e:
+                            st.error(f"Error al ejecutar con Claude API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
+
+    # ==========================================================================
+    # MODO "POR DEPORTE" — un prompt (y opcionalmente una llamada a Claude)
+    # por cada familia de deporte que sí necesita verificación de IA.
+    # ==========================================================================
+    if "prompts_por_grupo" in st.session_state and st.session_state["prompts_por_grupo"]:
+        st.divider()
+        st.subheader("🧩 Modo por deporte — prompts individuales")
+        prompts_por_grupo = st.session_state["prompts_por_grupo"]
+
+        for familia, prompt_texto in prompts_por_grupo.items():
+            with st.expander(f"📋 Prompt — {familia.upper()}"):
+                st.code(prompt_texto, language="markdown")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecutar TODOS los grupos con Claude API")
+            st.caption(
+                "Corre una llamada por cada familia de deporte (cada una con su propia "
+                "búsqueda web forzada) y acumula el resultado y el uso de tokens de todas."
+            )
+            modelos_claude_grp = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude_grp:
+                modelo_default_grp = next(
+                    (m for m in modelos_claude_grp if "sonnet" in m.lower()), modelos_claude_grp[0]
+                )
+                modelo_grp_elegido = st.selectbox(
+                    "Modelo Claude para el modo por deporte:",
+                    modelos_claude_grp,
+                    index=modelos_claude_grp.index(modelo_default_grp),
+                    key="modelo_por_deporte",
+                )
+                if st.button("🤖 Analizar TODOS los grupos", type="primary", key="btn_todos_grupos"):
+                    total_entrada, total_salida = 0, 0
+                    for familia, prompt_texto in prompts_por_grupo.items():
+                        with st.spinner(f"Analizando {familia.upper()} (con búsqueda web activa)..."):
+                            try:
+                                resultado, queries, uso_tokens, _ = llamar_claude_rest(
+                                    anthropic_api_key, modelo_grp_elegido, prompt_texto, max_tokens=8000,
+                                )
+                                st.markdown(f"### 🏆 Resultado — {familia.upper()}")
+                                st.markdown(resultado)
+                                if queries:
+                                    with st.expander(f"🔍 Búsquedas realizadas en {familia.upper()} ({len(queries)})"):
+                                        for q in queries:
+                                            st.write(f"- {q}")
+                                entrada_tok = uso_tokens.get("input_tokens", 0) or 0
+                                salida_tok = uso_tokens.get("output_tokens", 0) or 0
+                                total_entrada += entrada_tok
+                                total_salida += salida_tok
+                                st.caption(
+                                    f"{familia.upper()}: {entrada_tok:,} tokens de entrada · "
+                                    f"{salida_tok:,} de salida."
+                                )
+                            except Exception as e:
+                                st.error(f"Error al analizar {familia.upper()}: {e}")
+                    st.divider()
+                    st.success(
+                        f"✅ Corrida por deporte completa — TOTAL: {total_entrada:,} tokens de "
+                        f"entrada · {total_salida:,} de salida · {total_entrada + total_salida:,} tokens "
+                        f"en total (sobre {len(prompts_por_grupo)} grupo(s))."
+                    )
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")import json
+import os
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+import streamlit as st
+
+# soccerdata es OPCIONAL: si no está instalado (pip install soccerdata), el
+# backend simplemente no intenta resolver ClubElo por su cuenta y soccer cae
+# directo a fuente_primaria = elofootball.com (o ESPN Analytics para ligas no
+# europeas) para que la IA lo busque (ver sección 1d más abajo).
+try:
+    import soccerdata as sd
+    _SOCCERDATA_DISPONIBLE = True
+except ImportError:
+    _SOCCERDATA_DISPONIBLE = False
+
+# ==============================================================================
+# 1. SYSTEM PROMPT V3.5 — BLINDADO
+#    Restaura y amplía las salvaguardas: fuentes por deporte, gate de frescura
+#    relativo, Model Registry obligatorio, motor Elo interno calibrado como
+#    segundo modelo válido, reglas anti-fabricación, formato de salida fijo,
+#    tabla de transparencia de descartes (v3.3), y ahora (v3.4 + v3.5 + v3.6):
+#      - Chequeo obligatorio de lesión/estado físico para tenis, boxeo y MMA.
+#      - Fuente de respaldo documentada (campo `fuente_respaldo` en el
+#        registry) para cuando la fuente primaria no expone un número público.
+#      - Sección de salida "CASI CALIFICÓ" con los eventos más cercanos al
+#        umbral que no pasaron.
+#      - NUEVO v3.5: Gate de riesgo de empate para fútbol/soccer — obliga a
+#        usar Draw No Bet (estimado matemáticamente desde el devig 1X2) o a
+#        penalizar la Confianza cuando la probabilidad de empate de Pinnacle
+#        es alta, para no perder picks con EV positivo por un empate.
+#      - NUEVO v3.6: Cobertura real de esports (14 títulos con sport_key
+#        confirmado de The Odds API) vía Liquipedia/HLTV/VLR.gg/Octane.gg, y
+#        excepción explícita al gate de liquidez mínima (regla 4) para
+#        eventos "esports_*", que estructuralmente reportan menos casas de
+#        apuestas que los deportes tradicionales.
+# ==============================================================================
+SYSTEM_PROMPT_BLINDADO_V3_2 = """
+PROMPT — Analista Cuantitativo de Apuesta Única (Blindado v3.6)
+
+ROL Y OBJETIVO:
+Actúa como Analista Cuantitativo de Deportes y Tipster Profesional. Tu objetivo es
+seleccionar UNA sola apuesta —la de mayor confianza estadística— dentro de un rango
+de cuota 1.40-2.00 (moneyline o mercado principal), de TODOS los eventos recibidos.
+Un informe con 0 picks es un resultado VÁLIDO y ESPERADO en la mayoría de los días.
+Nunca fuerces un pick para "tener algo que mostrar".
+
+METODOLOGÍA Y REGLAS CLAVE:
+
+1. ANCLA OBLIGATORIA: Usa directamente el campo `_pinnacle_devig` que el backend ya
+   calculó. No recalcules el de-vig.
+
+2. GATE DE FRESCURA (relativo al tiempo restante, NO un umbral fijo):
+   Pinnacle solo actualiza el precio cuando se mueve la línea. Si a un evento le
+   faltan muchas horas para empezar, es NORMAL que `_pinnacle_last_update` tenga
+   varias horas de antigüedad — eso NO es dato obsoleto, es un mercado tranquilo.
+   Compara `_pinnacle_last_update` contra `inicio_utc`, no contra la hora actual:
+   - Si al evento le faltan MENOS de 3 horas para empezar Y `_pinnacle_last_update`
+     tiene más de 90 minutos de antigüedad → señal real de posible dato
+     desactualizado cerca del cierre del mercado → DESCARTA el evento.
+   - Si al evento le faltan MÁS de 3 horas, la antigüedad de `_pinnacle_last_update`
+     es solo informativa: NO descartes el evento por este motivo.
+
+3. VALIDACIÓN CRUZADA (Segundo Modelo) — EXCLUSIVAMENTE vía Model Registry:
+   Cada evento trae `_registry_modelo_secundario` con la fuente autorizada para
+   ese deporte específico. Reglas ESTRICTAS según el campo `cobertura`:
+
+   - "externa_directa": debes REALIZAR la búsqueda web real en `fuente_primaria`
+     (o `fuente_secundaria` si la primaria falla) ANTES de concluir que no se
+     puede verificar. Prohibido responder "no se puede confirmar" sin haber
+     intentado la búsqueda.
+     - RESPALDO DOCUMENTADO (nuevo en v3.4): si ni `fuente_primaria` ni
+       `fuente_secundaria` exponen un número públicamente accesible tras un
+       intento real de búsqueda, revisa si el evento trae un campo
+       `fuente_respaldo` en el registry. Si existe, puedes usarlo — pero
+       cítalo EXPLÍCITAMENTE como respaldo, nunca como si fuera la fuente
+       primaria. Ejemplo correcto: "Fuente: ESPN Analytics — Matchup
+       Predictor (respaldo documentado; FanGraphs no expuso un número
+       público tras la búsqueda)".
+     - Si NO hay `fuente_respaldo` documentada y ninguna de las fuentes
+       oficiales dio un número verificable, el evento se descarta en la
+       categoría 2 (segundo modelo no disponible), con nota "fuente primaria
+       inaccesible, sin respaldo documentado". PROHIBIDO improvisar o
+       sustituir con una fuente no listada en el registry ni en su campo
+       `fuente_respaldo`.
+
+   - "modelo_interno_elo": el backend YA calculó una probabilidad calibrada con
+     resultados reales recientes (no es una fuente web). Usa directamente los
+     campos `probabilidad_elo_home`, `elo_home`, `elo_away`,
+     `brier_score_historico` y `muestras_brier` como segundo modelo — NO hace
+     falta buscar en la web para estos eventos. Cita la fuente como:
+     "Modelo Elo interno (backend), calibrado con {muestras_brier} resultados
+     reales, Brier histórico {brier_score_historico}".
+
+   - "pendiente_desarrollo": no hay fuente externa definida NI historial Elo
+     interno suficiente todavía para ese equipo/deporte. DESCARTA
+     automáticamente sin buscar en otro lado y sin usar un modelo "propio"
+     improvisado — eso sería fabricación.
+
+   - "excluido_estructural": ya debería venir excluido del JSON; si aparece,
+     descarta sin análisis (partidos de exhibición/preseason).
+
+   PROHIBIDO ABSOLUTO: usar cualquier fuente, rating o modelo que no aparezca
+   literalmente en `_registry_modelo_secundario` de ese evento específico
+   (ya sea en `fuente_primaria`, `fuente_secundaria`, o `fuente_respaldo`).
+
+3b. CHEQUEO DE ESTADO FÍSICO — OBLIGATORIO PARA TENIS, BOXEO Y MMA (nuevo en v3.4):
+   Además de la fuente de rating (TennisAbstract, BoxRec, etc.), para estos tres
+   deportes DEBES hacer una búsqueda web adicional específica sobre noticias
+   recientes (últimas 48-72h) de lesión, retiro, molestia física, o estado de
+   forma del competidor. Un rating Elo o ranking NO captura esto — solo refleja
+   resultados pasados, no el estado físico actual.
+   - Si encuentras una noticia real y citable de lesión/molestia/duda física
+     relevante que el rating no puede haber incorporado todavía, esto reduce
+     la Confianza (regla 6) de forma explícita, aunque EV y divergencia pasen
+     los umbrales. Nunca ignores esta señal solo porque el EV se ve atractivo.
+   - Si no encuentras nada relevante tras la búsqueda, decláralo explícitamente
+     en el informe (ej. "Sin noticias de lesión/estado físico en las últimas
+     72h según [fuente/búsqueda]") — la ausencia de hallazgos debe quedar
+     documentada, no asumida.
+
+3c. GATE DE RIESGO DE EMPATE — SOLO FÚTBOL/SOCCER (nuevo en v3.5):
+   El mercado moneyline en fútbol es a 3 resultados: el empate es una fuga
+   real de EV incluso en picks matemáticamente positivos. Para TODO evento
+   cuyo `sport_key` empiece con "soccer", ANTES de confirmar un pick en
+   moneyline, evalúa el campo `_prob_empate_pinnacle` (probabilidad de-vigged
+   de empate según Pinnacle):
+
+   - Si `_prob_empate_pinnacle >= 0.30` (30%): el evento NO puede recomendarse
+     en moneyline puro. Si el evento pasó los umbrales de EV/divergencia,
+     usa en su lugar el campo `_draw_no_bet_estimado` para ese lado:
+       - Cuota a usar: `cuota_justa_dnb_estimada`.
+       - Probabilidad del segundo modelo: renormalízala tú mismo excluyendo
+         el empate, con la misma fórmula que usa el backend:
+         P_dnb_modelo(lado) = P_modelo(lado) / (P_modelo(home) + P_modelo(away))
+       - Recalcula el EV% con esa cuota y esa probabilidad renormalizada.
+       - En el informe, el campo "Mercado" debe decir explícitamente
+         "Draw No Bet (estimado desde 1X2, no es cuota real de mercado)" —
+         nunca lo presentes como si fuera un moneyline normal.
+   - Si `0.25 <= _prob_empate_pinnacle < 0.30`: puedes recomendar moneyline,
+     pero DEBES bajar la Confianza en al menos 2 puntos de forma explícita,
+     citando el % de empate como motivo (ej. "Confianza reducida por riesgo
+     de empate: Pinnacle de-vigged asigna 27% a empate").
+   - Si `_prob_empate_pinnacle < 0.25`: no se requiere ajuste por este motivo.
+
+   Esta regla es ADICIONAL a los gates de EV/divergencia/confianza — no los
+   reemplaza. Un evento puede pasar EV y divergencia y aun así requerir DNB
+   en lugar de moneyline, o ver reducida su Confianza, por esta regla.
+
+4. LIQUIDEZ: Usa el campo `_liquidez_backend` tal cual. No la reinterpretes.
+   Un evento con menos de 2 casas reportando NO califica (liquidez insuficiente).
+
+   EXCEPCIÓN ESPORTS (nuevo en v3.6): para eventos cuyo `sport_key` empiece
+   con "esports", esta regla de liquidez mínima NO aplica. Nunca descartes un
+   evento de esports en la categoría 3 por tener menos de 2 casas reportando
+   (incluso si solo reporta Pinnacle). Motivo: los mercados de esports tienen
+   estructuralmente mucha menos cobertura de bookmakers que los deportes
+   tradicionales — exigir el mismo mínimo los descartaría de forma sistemática
+   sin relación real con la calidad del pick. Aun así, sigue reportando el
+   valor real de `_liquidez_backend` y `_n_casas_reportando` en el informe
+   (transparencia), y esta excepción NO exime al evento del resto de las
+   reglas — EV, divergencia y confianza (reglas 5 y 6) se evalúan igual, sin
+   excepción, para esports.
+
+5. UMBRALES DE DESCARTE (ajustados v3.3 — ligeramente más permisivos que v3.2):
+   - EV < 4% → descartar (antes 5%).
+   - Divergencia |Pinnacle - Segundo Modelo| > 9% → descartar (antes 7%; señal
+     de posible error de datos, no de "value").
+   - Si el segundo modelo es "modelo_interno_elo" y `brier_score_historico` es
+     peor que 0.23 o `muestras_brier` < 8, el backend ya lo habría excluido —
+     pero si por alguna razón lo ves con esos valores, descarta igual.
+
+6. CONFIANZA (1-10): Calcula con el siguiente desglose visible en el informe:
+   - Edge estadístico (EV real vs. umbral)
+   - Calidad/frescura de la fuente del segundo modelo (una fuente externa
+     reciente pesa más que un modelo interno con pocas muestras; una fuente
+     de respaldo documentada pesa menos que la fuente primaria oficial)
+   - Liquidez del mercado
+   - Coherencia entre movimiento de línea (si hay datos) y el pick
+   - Para tenis/boxeo/MMA: resultado del chequeo de estado físico (regla 3b).
+     Una noticia real de lesión/molestia no cuantificable en el rating debe
+     bajar este componente de forma explícita.
+   - Para fútbol: resultado del gate de riesgo de empate (regla 3c).
+   Un pick solo califica si la confianza total es >= 8/10.
+
+REGLAS ANTI-FABRICACIÓN (obligatorias, sin excepción):
+- Nunca inventes lesiones, alineaciones, clima o noticias que no hayas confirmado
+  con una fuente real y citada.
+- Nunca inventes cuotas, nombres de equipos/jugadores o resultados históricos que
+  no estén en el JSON de entrada o en una fuente web verificada.
+- Si falta cualquier dato necesario para completar el análisis de un evento, ese
+  evento se descarta — nunca se rellena el vacío con una suposición "razonable".
+- Cada afirmación estadística debe llevar su fuente (nombre + URL, "Modelo Elo
+  interno" con sus métricas si aplica, o la fuente de respaldo citada como tal).
+- Si un evento se descartó en la categoría 1, 2 o 3 (frescura, pendiente_desarrollo
+  /fuente inaccesible sin respaldo, o liquidez), NUNCA calcules ni inventes un EV%
+  o divergencia% para él — en esos casos ni siquiera se llegó a evaluar el segundo
+  modelo. Repórtalo como "N/A — no se calculó" en la tabla de la sección 4.
+- El campo `fuente_respaldo` NUNCA se usa por comodidad o para ahorrar una
+  búsqueda — solo se usa después de haber intentado realmente la fuente primaria
+  y, si aplica, la secundaria, y haber confirmado que ninguna expone un número
+  público.
+- El campo `_draw_no_bet_estimado` es una ESTIMACIÓN matemática del backend
+  (renormalización del devig 1X2 de Pinnacle sin el empate), no una cuota real
+  ofrecida por ningún libro. Nunca la presentes como cuota de mercado — siempre
+  aclara que es estimada.
+
+CATEGORIZACIÓN DE DESCARTES — MUTUAMENTE EXCLUYENTE (v3.3, ajustada en v3.4):
+Cada evento descartado cae en EXACTAMENTE UNA categoría, evaluada en este orden
+de prioridad (aplica la primera que corresponda y detente ahí, no evalúes las
+siguientes para ese evento):
+   1º Gate de frescura (regla 2)
+   2º Segundo modelo no disponible — "pendiente_desarrollo" O "externa_directa"
+      sin fuente primaria/secundaria accesible NI `fuente_respaldo` documentada
+      (regla 3)
+   3º Liquidez insuficiente — menos de 2 casas (regla 4)
+   4º EV por debajo del umbral (regla 5)
+   5º Divergencia por encima del umbral (regla 5)
+   6º Confianza por debajo de 8/10, aun con EV y divergencia dentro de rango
+      (incluye el caso de una señal de estado físico no cuantificable, regla 3b,
+      o de riesgo de empate no compensado con DNB, regla 3c)
+Un evento NUNCA debe contarse en dos categorías a la vez.
+
+AUTO-VERIFICACIÓN OBLIGATORIA ANTES DE ENTREGAR EL INFORME:
+Suma (eventos por cada categoría de descarte) + (1 si hay pick, 0 si no) debe
+ser EXACTAMENTE igual al número total de eventos evaluados que recibiste en el
+JSON. Si no cuadra, revisa tu categorización y corrígela antes de responder —
+no entregues un informe con números que no concilien.
+
+FORMATO DE SALIDA (obligatorio, en español):
+1. Resumen: cuántos eventos se evaluaron y el desglose EXACTO por categoría
+   (las 6 de arriba), con la verificación de que suman el total.
+2. Si hay pick: Partido | Mercado | Cuota Pinnacle | Prob. implícita de-vigged |
+   Prob. segundo modelo (con fuente/métricas) | EV% | Confianza (con desglose) |
+   Justificación en 3-4 líneas.
+   Para fútbol: el campo "Mercado" debe indicar "Moneyline" o "Draw No Bet
+   (estimado)" según lo que haya determinado la regla 3c — nunca lo dejes
+   ambiguo.
+3. Si NO hay pick: decirlo explícitamente en la primera línea ("PICK DEL DÍA:
+   NINGUNO") y explicar brevemente, por categoría, por qué ningún evento
+   alcanzó el umbral.
+4. TABLA DE TRANSPARENCIA — solo para eventos que SÍ llegaron a calcularse
+   (categorías 4, 5 y 6 — EV insuficiente, divergencia excesiva, o confianza
+   <8/10). Para las categorías 1, 2 y 3 (frescura, pendiente_desarrollo/fuente
+   inaccesible, liquidez insuficiente) NO se arma tabla evento por evento —
+   repórtalas solo como conteo agregado en el resumen (punto 1), porque en esas
+   categorías nunca se llegó a calcular EV ni divergencia y desglosarlas no
+   aporta información nueva.
+
+   Formato de la tabla (una fila por evento de las categorías 4/5/6):
+   | Partido | Categoría | EV% | Divergencia% | Confianza | Motivo breve (1 línea) |
+
+   - EV% y Divergencia%: el número real calculado, con 1-2 decimales.
+   - Confianza: solo aplica si el evento llegó a la categoría 6 (si fue
+     descartado en 4 o 5, escribe "N/A — descartado antes de este cálculo").
+   - Motivo breve: la razón puntual (ej. "EV 0.1%, por debajo del umbral 4%",
+     "Divergencia 9.7% vs Pinnacle, fuente TennisAbstract hElo", "Confianza
+     6/10 — fuente externa reciente pero noticia de lesión no cuantificable",
+     "Confianza 6/10 — riesgo de empate 27% (regla 3c)").
+5. CASI CALIFICÓ (nuevo en v3.4): de los eventos en categorías 4, 5 y 6 que SÍ
+   tuvieron datos reales calculados (no los marcados "N/A — no se pudo
+   verificar"), identifica los 1-3 que estuvieron más cerca de pasar TODOS los
+   umbrales — por ejemplo, divergencia apenas sobre el 9%, EV apenas debajo del
+   4%, o confianza a 1-2 puntos de 8/10. Preséntalos en una tabla corta,
+   ordenada de más cerca a menos cerca del umbral:
+   | Partido | Qué faltó | Qué tan cerca (número exacto vs. umbral) |
+   Si ningún evento tiene datos reales suficientes para esta comparación,
+   omite la tabla y dilo explícitamente: "No hay eventos con datos suficientes
+   para evaluar cercanía al umbral en esta corrida."
+"""
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
+ANTHROPIC_VERSION = "2023-06-01"
+
+# ==============================================================================
+# 1b. MODEL REGISTRY — fuentes autorizadas de segundo modelo, por deporte.
+#
+# CAMBIO (este parche): soccer ya NO es una única entrada genérica que le pide
+# a la IA buscar en elofootball.com para CUALQUIER liga. elofootball cubre
+# ~55 países europeos únicamente — para una liga sudamericana, MLS, etc., pedir
+# esa fuente primaria no es "un intento que puede fallar", es estructuralmente
+# imposible que tenga el dato. Eso gastaba búsquedas/tokens en vano y empujaba
+# eventos a categoría 2 sin necesidad.
+#
+# Ahora:
+#   - Ligas que SÍ cubre elofootball → fuente_primaria = elofootball.com,
+#     fuente_respaldo = ESPN Analytics (Matchup Predictor), igual que MLB.
+#   - Ligas conocidas que elofootball NO cubre (Sudamérica, MLS, Liga MX, etc.)
+#     → fuente_primaria = ESPN Analytics directamente (sin intento fútil a
+#     elofootball primero).
+#   - Catch-all genérico "soccer" al FINAL de la lista (importa el orden: ver
+#     _buscar_base_registry, que usa "in" sobre el sport_key y toma el primer
+#     match) para cualquier liga no mapeada explícitamente todavía. Por
+#     seguridad, este catch-all también apunta a ESPN Analytics como primaria
+#     — es la fuente con mejor cobertura global, más razonable como default
+#     para una liga que no identificamos de antemano que sea europea.
+#
+#   - AGREGADO: entradas para ESPORTS con los `sport_key` reales confirmados
+#     de The Odds API — CS2 (esports_csgo, HLTV), Valorant (esports_valorant,
+#     VLR.gg), League of Legends (esports_lol), Dota 2 (esports_dota2),
+#     Overwatch (esports_overwatch), StarCraft II (esports_starcraft2),
+#     Honor of Kings (esports_kingofglory), Rainbow Six Siege (esports_r6),
+#     Rocket League (esports_rl, Octane.gg), Mobile Legends: Bang Bang
+#     (esports_mlbb), PUBG (esports_pubg), Call of Duty (esports_cod), League
+#     of Legends: Wild Rift (esports_wildrift) y StarCraft: Brood War
+#     (esports_bw) — más un catch-all genérico "esports" → Liquipedia para
+#     cualquier título nuevo que Odds API agregue y no esté mapeado todavía.
+#     Antes de esto, cualquier evento con sport_key "esports_*" caía directo
+#     a DEFAULT_REGISTRY_ENTRY ("pendiente_desarrollo") y dependía 100% de
+#     que el motor Elo interno acumulara historial desde cero — ahora tienen
+#     fuente externa real desde el día uno, igual que fútbol o tenis.
+#     NOTA: además, la regla 4 del prompt (LIQUIDEZ) trae una excepción
+#     explícita para "esports_*" — no se descartan por menos de 2 casas
+#     reportando, porque estructuralmente tienen menos cobertura de
+#     bookmakers que deportes tradicionales (ver esa regla para el detalle).
+# ==============================================================================
+REGISTRY_ULTIMA_REVISION = "2026-08-27"
+
+MODEL_REGISTRY = [
+    {"patron": "americanfootball_nfl_preseason", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "excluido_estructural", "version": "1.0", "usa_elo_interno": False},
+
+    # --- SOCCER: ligas europeas cubiertas por elofootball.com -------------
+    # (patrones de sport_key típicos de The Odds API; ajusta/agrega según los
+    # que realmente veas en tu cuenta con obtener_deportes_activos)
+    {"patron": "soccer_epl", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_efl_champ", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_germany_bundesliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_germany_bundesliga2", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_italy_serie_a", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_italy_serie_b", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_spain_la_liga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_spain_segunda_division", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_france_ligue_one", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_france_ligue_two", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_netherlands_eredivisie", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_portugal_primeira_liga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_belgium_first_div", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_turkey_super_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_switzerland_superleague", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_austria_bundesliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_greece_super_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_denmark_superliga", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_sweden_allsvenskan", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_champs_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_europa_league", "fuente_primaria": "elofootball.com", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+    {"patron": "soccer_uefa_europa_conference_league", "fuente_primaria": "elofootball.com",
+     "fuente_secundaria": None, "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.2", "usa_elo_interno": False},
+
+    # --- SOCCER: ligas NO cubiertas por elofootball.com --------------------
+    # (Sudamérica, Norteamérica no-europea, etc.) → directo a ESPN Analytics
+    # como fuente_primaria, sin pasar por un intento fútil en elofootball.
+    {"patron": "soccer_brazil_campeonato", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_brazil_serie_b", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_argentina_primera_division", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_mexico_ligamx", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_usa_mls", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_conmebol_copa_libertadores", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_conmebol_copa_sudamericana", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_chile_campeonato", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "soccer_colombia_primera_a", "fuente_primaria": "ESPN Analytics (Matchup Predictor)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+
+    # --- SOCCER: catch-all genérico — DEBE IR AL FINAL de todos los "soccer_*"
+    # de arriba, porque _buscar_base_registry hace matching por substring
+    # ("patron" in sport_key_low) y toma el primer match de la lista. Si este
+    # catch-all quedara antes, interceptaría a TODAS las ligas específicas.
+    # Por defecto apunta a ESPN Analytics (mejor cobertura global) en vez de
+    # elofootball, para no asumir de entrada que una liga no mapeada es
+    # europea.
+    {"patron": "soccer", "fuente_primaria": "ESPN Analytics (Matchup Predictor)", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.3", "usa_elo_interno": False},
+
+    # --- ESPORTS -------------------------------------------------------
+    # Igual que soccer: entradas específicas por título ANTES del catch-all
+    # genérico "esports" (el orden importa por el matching por substring en
+    # _buscar_base_registry). Ninguna de estas fuentes es un Elo calibrado
+    # propio como TennisAbstract — son rankings editoriales/estadísticos
+    # públicos, por eso quedan como "externa_directa" (requieren búsqueda
+    # real de la IA, igual que fútbol), no como "modelo_interno_elo".
+    {"patron": "esports_csgo", "fuente_primaria": "HLTV (World Ranking)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (CS2 rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_valorant", "fuente_primaria": "VLR.gg (rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (Valorant rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_lol", "fuente_primaria": "Liquipedia (LoL power rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Oracle's Elixir (stats por equipo)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_dota2", "fuente_primaria": "Liquipedia (Dota 2 rankings)",
+     "fuente_secundaria": None, "fuente_respaldo": "OpenDota (stats por equipo)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_overwatch", "fuente_primaria": "Liquipedia (Overwatch rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_kingofglory", "fuente_primaria": "Liquipedia (King of Glory rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_starcraft2", "fuente_primaria": "Liquipedia (StarCraft II rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_r6", "fuente_primaria": "Liquipedia (Rainbow Six Siege rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_rl", "fuente_primaria": "Octane.gg (Rocket League ratings)",
+     "fuente_secundaria": None, "fuente_respaldo": "Liquipedia (Rocket League rankings)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "esports_mlbb", "fuente_primaria": "Liquipedia (Mobile Legends: Bang Bang rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_pubg", "fuente_primaria": "Liquipedia (PUBG rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_cod", "fuente_primaria": "Liquipedia (Call of Duty rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_wildrift", "fuente_primaria": "Liquipedia (League of Legends: Wild Rift rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "esports_bw", "fuente_primaria": "Liquipedia (StarCraft: Brood War rankings)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    # Catch-all genérico "esports" — DEBE IR AL FINAL de los "esports_*"
+    # específicos de arriba, por el mismo motivo que el catch-all "soccer":
+    # si quedara antes, interceptaría a todos los títulos ya mapeados.
+    {"patron": "esports", "fuente_primaria": "Liquipedia (rankings del título correspondiente)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+
+    {"patron": "tennis", "fuente_primaria": "TennisAbstract (Elo por superficie)",
+     "fuente_secundaria": "Ranking oficial ATP/WTA", "cobertura": "externa_directa", "version": "1.0",
+     "usa_elo_interno": False},
+    {"patron": "baseball_mlb", "fuente_primaria": "FanGraphs", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "baseball_kbo", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "baseball_npb", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "basketball_nba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "basketball_wnba", "fuente_primaria": "Basketball-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "basketball_ncaab", "fuente_primaria": "Basketball-Reference (NCAA)", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "icehockey_nhl", "fuente_primaria": "Hockey-Reference", "fuente_secundaria": None,
+     "fuente_respaldo": "ESPN Analytics (Matchup Predictor)",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "cricket", "fuente_primaria": "ICC Team Ratings", "fuente_secundaria": "ESPN Cricinfo",
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "boxing", "fuente_primaria": "BoxRec ratings", "fuente_secundaria": None,
+     "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+    {"patron": "mma", "fuente_primaria": None, "fuente_secundaria": None,
+     "cobertura": "pendiente_desarrollo", "version": "1.0", "usa_elo_interno": True},
+    {"patron": "americanfootball_nfl", "fuente_primaria": "ESPN FPI (Football Power Index)",
+     "fuente_secundaria": None, "cobertura": "externa_directa", "version": "1.0", "usa_elo_interno": False},
+]
+
+DEFAULT_REGISTRY_ENTRY = {
+    "fuente_primaria": None, "fuente_secundaria": None,
+    "cobertura": "pendiente_desarrollo", "version": "0.0", "usa_elo_interno": True,
+}
+
+
+def _buscar_base_registry(sport_key):
+    if not sport_key:
+        return dict(DEFAULT_REGISTRY_ENTRY)
+    sport_key_low = sport_key.lower()
+    return dict(next((e for e in MODEL_REGISTRY if e["patron"] in sport_key_low), DEFAULT_REGISTRY_ENTRY))
+
+
+# ==============================================================================
+# 1c. MOTOR ELO INTERNO — para deportes sin fuente externa confiable
+# ==============================================================================
+
+try:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _BASE_DIR = os.getcwd()
+ELO_STATE_FILE = os.path.join(_BASE_DIR, "elo_state.json")
+ELO_INICIAL = 1500.0
+ELO_K_FACTOR = 20.0
+ELO_VENTAJA_LOCAL = 50.0
+ELO_MIN_PARTIDOS_POR_EQUIPO = 5
+ELO_MIN_MUESTRAS_BRIER = 8
+ELO_BRIER_MAXIMO_ACEPTABLE = 0.23  # peor que esto = descartar (naive/azar = 0.25)
+ELO_DIAS_HISTORIAL_SCORES = 3      # máximo permitido por el endpoint /scores
+
+
+def cargar_estado_elo():
+    if os.path.exists(ELO_STATE_FILE):
+        try:
+            with open(ELO_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"ratings": {}, "procesados": {}, "historial_brier": {}}
+
+
+def guardar_estado_elo(estado):
+    try:
+        with open(ELO_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.warning(f"No se pudo guardar el estado del motor Elo interno: {e}")
+
+
+def _prob_elo(elo_a, elo_b):
+    return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
+
+
+def calcular_brier(historial_sport):
+    if not historial_sport:
+        return None
+    return sum((h["prob"] - h["resultado"]) ** 2 for h in historial_sport) / len(historial_sport)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_scores_api(api_key, sport_key, dias=ELO_DIAS_HISTORIAL_SCORES):
+    """Resultados reales recientes (partidos ya jugados) para alimentar el motor
+    Elo interno. Cacheado 1h porque los resultados no cambian dentro de esa
+    ventana y cada llamada consume cuota de The Odds API."""
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/scores/"
+    params = {"apiKey": api_key, "daysFrom": dias}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code in (401, 422, 429):
+            return []
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def actualizar_elo_sport(api_key, sport_key, estado):
+    """Descarga resultados reales y actualiza ratings + historial de Brier
+    IN-PLACE sobre `estado`. Evita reprocesar el mismo partido dos veces."""
+    resultados = obtener_scores_api(api_key, sport_key)
+    if not resultados:
+        return estado
+
+    ratings = estado["ratings"].setdefault(sport_key, {})
+    procesados = set(estado["procesados"].setdefault(sport_key, []))
+    historial = estado["historial_brier"].setdefault(sport_key, [])
+
+    for evento in resultados:
+        if not isinstance(evento, dict) or not evento.get("completed"):
+            continue
+        game_id = evento.get("id")
+        if not game_id or game_id in procesados:
+            continue
+
+        home_team = evento.get("home_team")
+        away_team = evento.get("away_team")
+        scores = evento.get("scores")
+        if not home_team or not away_team or not scores:
+            continue
+
+        try:
+            score_home = next(float(s["score"]) for s in scores if s.get("name") == home_team)
+            score_away = next(float(s["score"]) for s in scores if s.get("name") == away_team)
+        except (StopIteration, ValueError, TypeError, KeyError):
+            continue
+
+        if score_home == score_away:
+            resultado_home = 0.5
+        else:
+            resultado_home = 1.0 if score_home > score_away else 0.0
+
+        home = ratings.setdefault(home_team, {"elo": ELO_INICIAL, "partidos": 0})
+        away = ratings.setdefault(away_team, {"elo": ELO_INICIAL, "partidos": 0})
+
+        prob_home_pre = _prob_elo(home["elo"] + ELO_VENTAJA_LOCAL, away["elo"])
+
+        home["elo"] += ELO_K_FACTOR * (resultado_home - prob_home_pre)
+        away["elo"] += ELO_K_FACTOR * ((1 - resultado_home) - (1 - prob_home_pre))
+        home["partidos"] += 1
+        away["partidos"] += 1
+
+        historial.append({"prob": prob_home_pre, "resultado": resultado_home})
+        procesados.add(game_id)
+
+    estado["procesados"][sport_key] = list(procesados)
+    return estado
+
+
+def obtener_entrada_modelo_interno(estado, sport_key, home_team, away_team):
+    """Devuelve la entrada de registry basada en Elo interno SOLO si hay
+    suficiente historial calificado y calibración aceptable. Si no, devuelve
+    None (el llamador debe entonces dejarlo como 'pendiente_desarrollo')."""
+    ratings = estado.get("ratings", {}).get(sport_key, {})
+    home = ratings.get(home_team)
+    away = ratings.get(away_team)
+    historial = estado.get("historial_brier", {}).get(sport_key, [])
+    brier = calcular_brier(historial)
+
+    calidad_suficiente = (
+        home is not None and away is not None
+        and home["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
+        and away["partidos"] >= ELO_MIN_PARTIDOS_POR_EQUIPO
+        and brier is not None
+        and len(historial) >= ELO_MIN_MUESTRAS_BRIER
+        and brier <= ELO_BRIER_MAXIMO_ACEPTABLE
+    )
+    if not calidad_suficiente:
+        return None
+
+    prob_home = _prob_elo(home["elo"] + ELO_VENTAJA_LOCAL, away["elo"])
+    return {
+        "fuente_primaria": "Modelo Elo interno (backend, calculado desde resultados reales vía Odds API /scores)",
+        "fuente_secundaria": None,
+        "cobertura": "modelo_interno_elo",
+        "version": "1.0",
+        "ultima_revision": REGISTRY_ULTIMA_REVISION,
+        "probabilidad_elo_home": round(prob_home, 4),
+        "elo_home": round(home["elo"], 1),
+        "elo_away": round(away["elo"], 1),
+        "partidos_calificados_home": home["partidos"],
+        "partidos_calificados_away": away["partidos"],
+        "brier_score_historico": round(brier, 4),
+        "muestras_brier": len(historial),
+    }
+
+
+def obtener_entrada_registry(sport_key, home_team=None, away_team=None, estado_elo=None):
+    """Punto único de verdad para el segundo modelo de un evento: primero mira
+    el registry estático; si ese deporte está marcado para usar Elo interno y
+    hay suficiente calidad, lo reemplaza por la entrada calculada.
+
+    Para soccer, ANTES de mirar el registry estático se intenta ClubElo vía
+    soccerdata (resuelto 100% por backend, sin gastar búsqueda de IA). Si eso
+    falla o no está disponible, se cae al registry estático — que ahora, tras
+    este parche, ya distingue entre ligas europeas (elofootball + respaldo
+    ESPN) y ligas no europeas (ESPN directo), en vez de mandar todo a
+    elofootball.com sin importar la liga."""
+    base = _buscar_base_registry(sport_key)
+
+    if sport_key and sport_key.lower().startswith("soccer") and home_team and away_team:
+        resuelto_por_backend = obtener_entrada_clubelo_backend(home_team, away_team)
+        if resuelto_por_backend:
+            return resuelto_por_backend
+
+    if (
+        base.get("usa_elo_interno")
+        and base["cobertura"] == "pendiente_desarrollo"
+        and estado_elo is not None
+        and home_team and away_team
+    ):
+        interno = obtener_entrada_modelo_interno(estado_elo, sport_key, home_team, away_team)
+        if interno:
+            return interno
+        ratings = estado_elo.get("ratings", {}).get(sport_key, {})
+        partidos_home = ratings.get(home_team, {}).get("partidos", 0)
+        partidos_away = ratings.get(away_team, {}).get("partidos", 0)
+        base["nota"] = (
+            f"Motor Elo interno activo pero con historial insuficiente todavía "
+            f"({home_team}: {partidos_home} partidos, {away_team}: {partidos_away} partidos, "
+            f"mínimo requerido: {ELO_MIN_PARTIDOS_POR_EQUIPO}). Se acumula automáticamente "
+            f"con cada corrida del sistema."
+        )
+
+    base["ultima_revision"] = REGISTRY_ULTIMA_REVISION
+    return base
+
+
+# ==============================================================================
+# 1d. MOTOR CLUBELO POR BACKEND (soccerdata)
+# ==============================================================================
+
+CLUBELO_VENTAJA_LOCAL = 60.0
+CLUBELO_CACHE_TTL_SEGUNDOS = 6 * 3600
+CLUBELO_JACCARD_MINIMO = 0.5
+
+
+@st.cache_data(ttl=CLUBELO_CACHE_TTL_SEGUNDOS, show_spinner=False)
+def _descargar_ranking_clubelo(fecha_iso):
+    if not _SOCCERDATA_DISPONIBLE:
+        return None
+    try:
+        elo = sd.ClubElo()
+        return elo.read_by_date(fecha_iso)
+    except Exception:
+        return None
+
+
+def _buscar_elo_equipo(df_ranking, nombre_equipo):
+    if df_ranking is None or getattr(df_ranking, "empty", True) or not nombre_equipo:
+        return None
+
+    columnas = list(df_ranking.columns)
+    columna_club = "team" if "team" in columnas else "Club" if "Club" in columnas else columnas[0]
+    columna_elo = "elo" if "elo" in columnas else "Elo" if "Elo" in columnas else None
+    if columna_elo is None:
+        return None
+
+    exacto = df_ranking[df_ranking[columna_club].astype(str).str.lower() == nombre_equipo.lower()]
+    if not exacto.empty:
+        return float(exacto.iloc[0][columna_elo])
+
+    tokens_buscado = set(nombre_equipo.lower().split())
+    mejor_score, mejor_elo = 0.0, None
+    for _, fila in df_ranking.iterrows():
+        tokens_candidato = set(str(fila[columna_club]).lower().split())
+        union = tokens_buscado | tokens_candidato
+        if not union:
+            continue
+        score = len(tokens_buscado & tokens_candidato) / len(union)
+        if score > mejor_score:
+            mejor_score, mejor_elo = score, float(fila[columna_elo])
+
+    return mejor_elo if mejor_score >= CLUBELO_JACCARD_MINIMO else None
+
+
+def obtener_entrada_clubelo_backend(home_team, away_team):
+    if not _SOCCERDATA_DISPONIBLE or not home_team or not away_team:
+        return None
+
+    fecha_hoy = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    df_ranking = _descargar_ranking_clubelo(fecha_hoy)
+    if df_ranking is None:
+        return None
+
+    elo_home = _buscar_elo_equipo(df_ranking, home_team)
+    elo_away = _buscar_elo_equipo(df_ranking, away_team)
+    if elo_home is None or elo_away is None:
+        return None
+
+    prob_home = _prob_elo(elo_home + CLUBELO_VENTAJA_LOCAL, elo_away)
+
+    return {
+        "fuente_primaria": (
+            "ClubElo (resuelto por el backend vía soccerdata/api.clubelo.com "
+            "— sin búsqueda de IA)"
+        ),
+        "fuente_secundaria": None,
+        "cobertura": "modelo_interno_elo",
+        "version": "1.0",
+        "ultima_revision": REGISTRY_ULTIMA_REVISION,
+        "probabilidad_elo_home": round(prob_home, 4),
+        "elo_home": round(elo_home, 1),
+        "elo_away": round(elo_away, 1),
+        "nota": (
+            f"Elo tomado directamente de ClubElo (fecha {fecha_hoy}), sin "
+            f"muestras/Brier propio — es el rating oficial de la fuente, no "
+            f"un modelo entrenado por Blindado."
+        ),
+    }
+
+
+# ==============================================================================
+# 2. FUNCIONES BACKEND — The Odds API (cuotas)
+# ==============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_deportes_activos(api_key):
+    """Lista de deportes activos hoy. Cacheado 1h: esto casi no cambia en el día."""
+    url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 401:
+            st.error("❌ API Key de The Odds API inválida o vencida.")
+            return []
+        if response.status_code == 429:
+            st.error("❌ Límite de requests alcanzado en The Odds API (429).")
+            return []
+        response.raise_for_status()
+        return [s for s in response.json() if s.get("active") and not s.get("has_outrights")]
+    except Exception as e:
+        st.error(f"Error al obtener deportes desde la API: {e}")
+        return []
+
+
+# ------------------------------------------------------------------------------
+# DIAGNÓSTICO DE LIQUIDEZ
+#
+# POR QUÉ EXISTE: en una corrida reciente, los 28 eventos evaluados en TODAS
+# las familias de deporte (tenis, soccer, cricket, WNBA, MLB) mostraron
+# exactamente `_n_casas_reportando: 1` — es decir, solo Pinnacle. Que el 100%
+# de eventos en 5 deportes tan distintos (incluyendo MLB, que normalmente es
+# de los mercados más líquidos que existen) tengan CERO cobertura de stake,
+# betonlineag y bet365 es sospechoso de un problema de fetch/plan/región, no
+# de un patrón real de mercado.
+#
+# Esta función NO decide nada por sí sola ni cambia el comportamiento de
+# filtrado — solo registra qué bookmakers vinieron realmente en la respuesta
+# cruda de la API para cada evento, para poder diagnosticarlo con datos reales
+# en vez de adivinar. Se muestra en un expander de la barra lateral.
+#
+# NOTA: esta instrumentación ya es GENÉRICA — corre sobre `datos_acumulados`
+# en la sección 4 sin importar qué deporte se haya seleccionado (soccer
+# incluido). No hace falta duplicarla por deporte.
+# ------------------------------------------------------------------------------
+
+def _extraer_bookmaker_keys(evento):
+    if not isinstance(evento, dict):
+        return []
+    return [b.get("key") for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key")]
+
+
+# Regiones soportadas por The Odds API. Se incluye "eu" siempre que se use
+# modo "regions" porque Pinnacle (ancla obligatoria del sistema, regla 1)
+# reporta bajo esa región — si se omite, los eventos empiezan a caer en
+# "descartados_sin_pinnacle" en vez de en el gate de liquidez.
+ODDS_API_REGIONS_COBERTURA_AMPLIA = "eu,us,us2,uk,au"
+ODDS_API_BOOKMAKERS_FIJOS = "pinnacle,stake,betonlineag,bet365"
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def obtener_cuotas_api(api_key, sport_key, modo_cobertura="bookmakers_fijos"):
+    """
+    Consulta cuotas para un deporte específico.
+
+    modo_cobertura:
+      - "bookmakers_fijos" (default, más barato en cuota): pide únicamente los
+        4 bookmakers listados en ODDS_API_BOOKMAKERS_FIJOS. NOTA: no se envía
+        'regions' junto con 'bookmakers' porque The Odds API ignora 'regions'
+        cuando 'bookmakers' está presente. Si tu plan de The Odds API no
+        incluye alguno de esos 4 (ver expander "🔍 Diagnóstico de liquidez"),
+        ese bookmaker simplemente nunca aparecerá, silenciosamente.
+      - "regiones_amplias" (más cobertura, MÁS COSTOSO EN CUOTA): pide
+        'regions' en vez de 'bookmakers' fijos, devolviendo TODOS los
+        bookmakers disponibles en tu plan para esas regiones. The Odds API
+        cobra más cuota por request mientras más regiones se piden — revisa
+        tu consumo en la sidebar ("📉 Odds API — usados/restantes") después
+        de probar este modo.
+
+    Cacheado 90s para no quemar cuota si el usuario da clic varias veces
+    seguidas. OJO: el cache_data de Streamlit indexa por TODOS los argumentos,
+    así que cambiar modo_cobertura entre corridas SÍ dispara una llamada nueva
+    (no reutiliza el caché del otro modo).
+
+    NOTA DE DIAGNÓSTICO: si notas que `_n_casas_reportando` sale bajo en el
+    informe final, revisa el expander "🔍 Diagnóstico de liquidez" en la
+    barra lateral tras ejecutar una corrida — ahí se ve, evento por evento, la
+    lista CRUDA de bookmaker keys que realmente devolvió la API antes de
+    cualquier filtrado.
+    """
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
+    params = {"apiKey": api_key, "markets": "h2h"}
+    if modo_cobertura == "regiones_amplias":
+        params["regions"] = ODDS_API_REGIONS_COBERTURA_AMPLIA
+    else:
+        params["bookmakers"] = ODDS_API_BOOKMAKERS_FIJOS
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        restantes = response.headers.get("x-requests-remaining")
+        usados = response.headers.get("x-requests-used")
+        if restantes is not None:
+            st.session_state["odds_api_uso"] = {"restantes": restantes, "usados": usados}
+
+        if response.status_code == 401:
+            st.error(f"❌ API Key inválida al consultar {sport_key}.")
+            return []
+        if response.status_code == 422:
+            return []  # deporte sin mercado h2h disponible, no es un error real
+        if response.status_code == 429:
+            st.warning(f"⚠️ Rate limit alcanzado en {sport_key}, se omite este deporte.")
+            return []
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return []
+
+
+def devig_probabilidades(outcomes):
+    if not outcomes:
+        return {}
+    implicitas = {
+        o["name"]: 1.0 / o["price"]
+        for o in outcomes
+        if isinstance(o, dict) and o.get("price") and o["price"] > 0
+    }
+    overround = sum(implicitas.values())
+    if overround == 0:
+        return {}
+    return {nombre: round(p / overround, 4) for nombre, p in implicitas.items()}
+
+
+def calcular_draw_no_bet(pinnacle_devig, home_name, away_name):
+    """
+    Calcula la cuota JUSTA de Draw No Bet (DNB) a partir de las probabilidades
+    de-vigged de Pinnacle en el mercado 1X2 (ya viene calculado en
+    `_pinnacle_devig`, no se pide nada nuevo a la API).
+
+    QUÉ RESUELVE: en el mercado moneyline de fútbol, un pick con EV positivo
+    puede perderse igual si el partido termina empatado — el empate es una
+    fuga de EV real que el moneyline puro no protege. DNB es un mercado donde,
+    si hay empate, se devuelve el stake (push): elimina esa fuga.
+
+    FÓRMULA: al quitar el empate del universo de resultados, las probabilidades
+    de home/away se renormalizan entre sí:
+        P_dnb(home) = P(home) / (P(home) + P(away))
+        P_dnb(away) = P(away) / (P(home) + P(away))
+    y la cuota justa es 1 / P_dnb. Esto es una ESTIMACIÓN matemática desde el
+    1X2 — no es la cuota real de un libro en su mercado DNB (que puede diferir
+    levemente por el margen propio de ese mercado). Se etiqueta como tal.
+    """
+    p_home = pinnacle_devig.get(home_name)
+    p_away = pinnacle_devig.get(away_name)
+    if p_home is None or p_away is None or (p_home + p_away) <= 0:
+        return None
+
+    p_dnb_home = p_home / (p_home + p_away)
+    p_dnb_away = p_away / (p_home + p_away)
+
+    return {
+        "nota": (
+            "Cuota justa DNB ESTIMADA matemáticamente desde el devig 1X2 de "
+            "Pinnacle (renormalizando sin el empate) — no es una cuota de "
+            "mercado real, es un techo teórico. Úsala solo como referencia "
+            "de rango, no la cites como si fuera cuota ofrecida por un libro."
+        ),
+        home_name: {
+            "prob_dnb": round(p_dnb_home, 4),
+            "cuota_justa_dnb_estimada": round(1 / p_dnb_home, 3) if p_dnb_home > 0 else None,
+        },
+        away_name: {
+            "prob_dnb": round(p_dnb_away, 4),
+            "cuota_justa_dnb_estimada": round(1 / p_dnb_away, 3) if p_dnb_away > 0 else None,
+        },
+    }
+
+
+def calcular_dispersion_mercado(evento):
+    """Mide la dispersión de probabilidades entre casas de apuestas, tomando el
+    spread máximo encontrado en CUALQUIER resultado del mercado (home, away,
+    draw) — no solo el local."""
+    if not isinstance(evento, dict):
+        return 0.0
+
+    probs_por_resultado = {}
+    for b in evento.get("bookmakers", []):
+        if not isinstance(b, dict):
+            continue
+        h2h = next((m for m in b.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        if not h2h:
+            continue
+        devig = devig_probabilidades(h2h.get("outcomes", []))
+        for nombre, prob in devig.items():
+            probs_por_resultado.setdefault(nombre, []).append(prob)
+
+    dispersiones = [
+        max(vals) - min(vals) for vals in probs_por_resultado.values() if len(vals) >= 2
+    ]
+    return max(dispersiones) if dispersiones else 0.0
+
+
+def registrar_y_calcular_movimientos(eventos_minificados, deporte_key):
+    if not eventos_minificados:
+        return {}
+    state_key = f"pinnacle_snapshot_{deporte_key}"
+    movimientos = {}
+    snapshot_actual = {}
+
+    for ev in eventos_minificados:
+        if not isinstance(ev, dict):
+            continue
+        ev_id = ev.get("id")
+        matchup = ev.get("partido")
+        prices = ev.get("cuotas_pinnacle", {})
+        if ev_id and prices:
+            snapshot_actual[ev_id] = {"matchup": matchup, "prices": prices}
+
+    if state_key in st.session_state and isinstance(st.session_state[state_key], dict):
+        snapshot_previo = st.session_state[state_key]
+        for ev_id, data_curr in snapshot_actual.items():
+            if ev_id in snapshot_previo:
+                data_prev = snapshot_previo[ev_id]
+                for team, price_curr in data_curr.get("prices", {}).items():
+                    price_prev = data_prev.get("prices", {}).get(team)
+                    if price_prev and price_prev != price_curr:
+                        pct_change = round(((price_curr - price_prev) / price_prev) * 100, 2)
+                        direccion = "subió" if pct_change > 0 else "bajó"
+                        movimientos[f"{data_curr['matchup']} ({team})"] = (
+                            f"Cuota cambió de {price_prev} a {price_curr} ({direccion} {abs(pct_change)}%)"
                         )
 
-            st.session_state["stake_events"] = dedupe_events(stake_events)
-            st.session_state["bovada_events"] = dedupe_events(bovada_events if bovada_enabled else [])
-            st.session_state["movement"] = movement
-            st.success(
-                f"Cargados {len(st.session_state['stake_events'])} eventos Stake y "
-                f"{len(st.session_state['bovada_events'])} referencias Bovada."
+    st.session_state[state_key] = snapshot_actual
+    return movimientos
+
+
+def filtrar_y_enriquecer(datos_crudos, estado_elo, horas_ventana=24):
+    if not datos_crudos or not isinstance(datos_crudos, list):
+        return [], "Backend pre-filtró 0 eventos (sin datos recibidos)."
+
+    eventos_validos = []
+    descartados_sin_pinnacle = 0
+    descartados_fuera_de_rango = 0
+    descartados_fecha = 0
+    descartados_sin_fecha = 0
+    descartados_exclusion_estructural = 0
+    eventos_con_elo_interno = 0
+    eventos_pendientes_desarrollo = 0
+
+    ahora_utc = datetime.now(timezone.utc)
+    limite_utc = ahora_utc + timedelta(hours=horas_ventana)
+
+    for evento in datos_crudos:
+        if not isinstance(evento, dict):
+            continue
+
+        home_team = evento.get("home_team")
+        away_team = evento.get("away_team")
+        registry_entry = obtener_entrada_registry(
+            evento.get("sport_key"), home_team=home_team, away_team=away_team, estado_elo=estado_elo
+        )
+        if registry_entry["cobertura"] == "excluido_estructural":
+            descartados_exclusion_estructural += 1
+            continue
+
+        commence_str = evento.get("commence_time")
+        if not commence_str:
+            descartados_sin_fecha += 1
+            continue
+        try:
+            commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+            if not (ahora_utc <= commence_dt <= limite_utc):
+                descartados_fecha += 1
+                continue
+        except Exception:
+            descartados_sin_fecha += 1
+            continue
+
+        pinnacle = next((b for b in evento.get("bookmakers", []) if isinstance(b, dict) and b.get("key") == "pinnacle"), None)
+        if not pinnacle:
+            descartados_sin_pinnacle += 1
+            continue
+
+        h2h = next((m for m in pinnacle.get("markets", []) if isinstance(m, dict) and m.get("key") == "h2h"), None)
+        if not h2h:
+            descartados_sin_pinnacle += 1
+            continue
+
+        outcomes = h2h.get("outcomes", [])
+        en_rango = any(1.40 <= o.get("price", 0) <= 2.00 for o in outcomes if isinstance(o, dict))
+        if not en_rango:
+            descartados_fuera_de_rango += 1
+            continue
+
+        pinnacle_devig = devig_probabilidades(outcomes)
+        n_bookmakers = len(evento.get("bookmakers", []))
+        dispersion = calcular_dispersion_mercado(evento)
+
+        if n_bookmakers >= 3 and dispersion < 0.05:
+            liquidez = "Alta"
+        elif n_bookmakers >= 2:
+            liquidez = "Media"
+        else:
+            liquidez = "Media/Baja — evaluar según categoría de liga"
+
+        cuotas_pinnacle = {o.get("name"): o.get("price") for o in outcomes if isinstance(o, dict)}
+
+        if registry_entry["cobertura"] == "modelo_interno_elo":
+            eventos_con_elo_interno += 1
+        elif registry_entry["cobertura"] == "pendiente_desarrollo":
+            eventos_pendientes_desarrollo += 1
+
+        # --- Riesgo de empate (solo fútbol, mercados a 3 resultados) -------
+        # Se calcula acá, en el backend, para que la IA no tenga que inventar
+        # o recalcular el devig de DNB por su cuenta — reduce fabricación y
+        # gasta 0 tokens de búsqueda. Ver regla 3c del prompt.
+        es_soccer = bool(evento.get("sport_key", "").lower().startswith("soccer"))
+        prob_empate_pinnacle = pinnacle_devig.get("Draw") if es_soccer else None
+        draw_no_bet_estimado = (
+            calcular_draw_no_bet(pinnacle_devig, home_team, away_team)
+            if es_soccer and prob_empate_pinnacle is not None
+            else None
+        )
+
+        evento_minificado = {
+            "id": evento.get("id"),
+            "deporte": evento.get("sport_title") or evento.get("sport_key"),
+            "sport_key": evento.get("sport_key"),
+            "partido": f"{home_team} vs {away_team}",
+            "inicio_utc": commence_str,
+            "cuotas_pinnacle": cuotas_pinnacle,
+            "_pinnacle_devig": pinnacle_devig,
+            "_pinnacle_last_update": pinnacle.get("last_update"),
+            "_liquidez_backend": liquidez,
+            "_dispersion_max_entre_casas": round(dispersion, 4),
+            "_n_casas_reportando": n_bookmakers,
+            "_registry_modelo_secundario": registry_entry,
+        }
+
+        if es_soccer and prob_empate_pinnacle is not None:
+            evento_minificado["_prob_empate_pinnacle"] = prob_empate_pinnacle
+            evento_minificado["_draw_no_bet_estimado"] = draw_no_bet_estimado
+
+        eventos_validos.append(evento_minificado)
+
+    resumen_filtro = (
+        f"Backend pre-filtró {len(datos_crudos)} eventos: "
+        f"{len(eventos_validos)} candidatos calificados (prx {horas_ventana}h, cuota 1.40-2.00), "
+        f"{descartados_fecha} descartados por fecha fuera de ventana, "
+        f"{descartados_sin_fecha} descartados por fecha faltante/ilegible, "
+        f"{descartados_sin_pinnacle} descartados sin Pinnacle, "
+        f"{descartados_fuera_de_rango} descartados fuera de rango de cuota, "
+        f"{descartados_exclusion_estructural} excluidos estructuralmente (preseason/exhibición). "
+        f"De los {len(eventos_validos)} candidatos: {eventos_con_elo_interno} resueltos por el motor "
+        f"Elo interno (calibrado) y {eventos_pendientes_desarrollo} siguen sin segundo modelo "
+        f"disponible (la IA los descartará)."
+    )
+    return eventos_validos, resumen_filtro
+
+
+# ==============================================================================
+# 2b. MODO "POR DEPORTE" (v3.5)
+# ==============================================================================
+
+def familia_deporte(sport_key):
+    if not sport_key:
+        return "otros"
+    return sport_key.split("_")[0]
+
+
+def agrupar_eventos_por_familia(eventos):
+    grupos = {}
+    for ev in eventos:
+        familia = familia_deporte(ev.get("sport_key"))
+        grupos.setdefault(familia, []).append(ev)
+    return grupos
+
+
+def separar_ia_vs_automatico(eventos_familia):
+    necesita_ia, automaticos = [], []
+    for ev in eventos_familia:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        if cobertura in ("pendiente_desarrollo", "excluido_estructural"):
+            automaticos.append(ev)
+        else:
+            necesita_ia.append(ev)
+    return necesita_ia, automaticos
+
+
+def resumen_automatico_grupo(familia, eventos_automaticos):
+    if not eventos_automaticos:
+        return None
+    lineas = [
+        f"**{familia.upper()}** — {len(eventos_automaticos)} evento(s), "
+        f"0 tokens de IA usados (descarte automático, categoría 2):"
+    ]
+    for ev in eventos_automaticos:
+        cobertura = ev.get("_registry_modelo_secundario", {}).get("cobertura")
+        lineas.append(f"- {ev.get('partido')} ({ev.get('deporte')}) — {cobertura}")
+    return "\n".join(lineas)
+
+
+def construir_prompt_grupo(familia, eventos_grupo, seleccion_label, hora_rd, seccion_movimiento):
+    return (
+        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+        f"==================================================\n"
+        f"CONTEXTO DE EJECUCIÓN DEL BACKEND (MODO POR DEPORTE)\n"
+        f"==================================================\n"
+        f"ÁMBITO GENERAL DE LA CORRIDA: {seleccion_label}\n"
+        f"GRUPO ANALIZADO EN ESTE PROMPT: {familia.upper()} "
+        f"({len(eventos_grupo)} evento(s))\n"
+        f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
+        f"{seccion_movimiento}\n\n"
+        f"NOTA IMPORTANTE: Este prompt contiene ÚNICAMENTE los eventos de la "
+        f"familia '{familia}' que ya pasaron el pre-filtrado de frescura y "
+        f"liquidez y tienen cobertura 'externa_directa' o 'modelo_interno_elo'. "
+        f"Los eventos de esta misma familia con cobertura 'pendiente_desarrollo' "
+        f"o 'excluido_estructural' YA fueron descartados por el backend sin "
+        f"usar IA (ver resumen aparte) — no vienen en este JSON, y por lo "
+        f"tanto NO deben aparecer en tu conteo de categoría 2 de este prompt "
+        f"(ese conteo se reporta aparte, fuera de la IA).\n\n"
+        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
+        f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
+        f"`_n_casas_reportando`, `_registry_modelo_secundario` y, para fútbol, "
+        f"`_prob_empate_pinnacle` / `_draw_no_bet_estimado` (regla 3c). No "
+        f"recalcules el de-vig ni filtres por rango nuevamente.\n\n"
+        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS (solo familia '{familia}'):\n"
+        f"{json.dumps(eventos_grupo, indent=2, ensure_ascii=False)}"
+    )
+
+
+def construir_prompts_por_deporte(eventos_filtrados, seleccion_label, hora_rd, seccion_movimiento):
+    grupos = agrupar_eventos_por_familia(eventos_filtrados)
+    prompts_por_grupo = {}
+    resúmenes_automaticos = []
+
+    for familia, eventos_familia in sorted(grupos.items()):
+        necesita_ia, automaticos = separar_ia_vs_automatico(eventos_familia)
+        if automaticos:
+            resumen = resumen_automatico_grupo(familia, automaticos)
+            if resumen:
+                resúmenes_automaticos.append(resumen)
+        if necesita_ia:
+            prompts_por_grupo[familia] = construir_prompt_grupo(
+                familia, necesita_ia, seleccion_label, hora_rd, seccion_movimiento
             )
-            if no_disponibles:
-                st.warning(f"Bovada no disponible para: {', '.join(no_disponibles)}")
-        except Exception as exc:
-            st.session_state["stake_events"] = []
-            st.session_state["bovada_events"] = []
-            st.error(f"No fue posible actualizar los datos: {exc}")
 
-    stake_events = st.session_state.get("stake_events", [])
-    bovada_events = st.session_state.get("bovada_events", [])
-    movements = st.session_state.get("movement", {"movements": []})
+    resumen_automatico_total = (
+        "\n\n".join(resúmenes_automaticos)
+        if resúmenes_automaticos
+        else "Ningún evento cayó en descarte 100% automático en esta corrida."
+    )
+    return prompts_por_grupo, resumen_automatico_total
 
-    if stake_events:
-        st.subheader("📊 Cobertura")
-        cols = st.columns(4)
-        cols[0].metric("Eventos Stake", len(stake_events))
-        cols[1].metric("Eventos Bovada", len(bovada_events))
-        cols[2].metric("Mercados Stake", sum(len(e.markets) for e in stake_events))
-        cols[3].metric("Movimientos", len(movements.get("movements", [])))
 
-        with st.expander("Fuentes estadísticas por deporte"):
-            for e in stake_events[:30]:
-                srcs = FreeSourceRegistry().sources_for(e)
-                st.write(f"**{e.sport}/{e.league} — {e.home} vs {e.away}**")
-                for src in srcs:
-                    st.write(f"- {src}")
+# ==============================================================================
+# 3. GEMINI — modelos SIEMPRE consultados en vivo (nunca hardcodeados).
+# ==============================================================================
 
-        if st.button("🧠 Ejecutar Blindado v5", type="primary"):
-            promotions = load_promotions()
-            candidates, counts = prepare_candidates(
-                stake_events, bovada_events, promotions, float(bankroll)
-            )
-            engine = BlindadoEngine(float(bankroll))
-            pick = engine.choose_one(candidates)
+@st.cache_data(ttl=1800, show_spinner=False)
+def listar_modelos_gemini(gemini_api_key):
+    url = f"{GEMINI_API_BASE}/models?key={gemini_api_key}"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        modelos = r.json().get("models", [])
+        utilizables = []
+        for m in modelos:
+            nombre = m.get("name", "").replace("models/", "")
+            metodos = m.get("supportedGenerationMethods", [])
+            if "generateContent" in metodos and not any(
+                x in nombre for x in ["image", "audio", "tts", "embedding", "live", "vision"]
+            ):
+                utilizables.append(nombre)
+        return sorted(utilizables, reverse=True)
+    except Exception as e:
+        st.error(f"No se pudo obtener la lista de modelos de Gemini: {e}")
+        return []
 
-            st.subheader("🏆 Resultado")
-            if pick is None:
-                st.error("PICK DEL DÍA: NINGUNO")
-                st.write(
-                    "No se encontró una apuesta que cumpla simultáneamente "
-                    "cuota, EV, divergencia, confianza y disponibilidad de mercado."
-                )
-            else:
-                report = candidate_report(pick, float(bankroll))
-                st.success("PICK DEL DÍA: 1 selección")
-                st.json(report)
 
-            st.subheader("🔎 Auditoría")
-            st.json(counts)
+def llamar_gemini_rest(gemini_api_key, modelo, prompt_texto):
+    url = f"{GEMINI_API_BASE}/models/{modelo}:generateContent"
+    headers = {"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt_texto}]}]}
+    r = requests.post(url, headers=headers, json=body, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    partes = data["candidates"][0]["content"]["parts"]
+    texto = "".join(p.get("text", "") for p in partes)
+    uso = data.get("usageMetadata", {})
+    return texto, uso
 
-        if st.button("📋 Generar prompt Blindado para IA"):
-            prompt = build_prompt(stake_events, movements)
-            st.session_state["prompt"] = prompt
 
-    if "prompt" in st.session_state:
-        st.subheader("📋 Prompt listo")
-        st.code(st.session_state["prompt"], language="text")
+# ==============================================================================
+# 3b. CLAUDE (Anthropic) — búsqueda web FORZADA vía tool en la propia llamada.
+# ==============================================================================
 
-    if st.checkbox("Mostrar eventos normalizados"):
-        rows = []
-        for e in stake_events:
-            for m in e.markets:
-                rows.append({
-                    "sport": e.sport,
-                    "league": e.league,
-                    "event": f"{e.home} vs {e.away}",
-                    "market": m.name,
-                    "outcomes": ", ".join(f"{o.selection}: {o.odds:.2f}" for o in m.outcomes),
-                    "start": e.start_time,
-                })
-        st.dataframe(rows, use_container_width=True)
+@st.cache_data(ttl=1800, show_spinner=False)
+def listar_modelos_claude(anthropic_api_key):
+    url = f"{ANTHROPIC_API_BASE}/models"
+    headers = {"x-api-key": anthropic_api_key, "anthropic-version": ANTHROPIC_VERSION}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        modelos = r.json().get("data", [])
+        return [m.get("id") for m in modelos if m.get("id")]
+    except Exception as e:
+        st.error(f"No se pudo obtener la lista de modelos de Claude: {e}")
+        return []
+
+
+def llamar_claude_rest(anthropic_api_key, modelo, prompt_texto, max_tokens=8000):
+    url = f"{ANTHROPIC_API_BASE}/messages"
+    headers = {
+        "x-api-key": anthropic_api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    body = {
+        "model": modelo,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt_texto}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+
+    partes_texto = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+    fuentes_buscadas = [
+        b.get("input", {}).get("query")
+        for b in data.get("content", [])
+        if b.get("type") == "server_tool_use" and b.get("name") == "web_search"
+    ]
+    texto_final = "\n\n".join(partes_texto)
+    queries = [q for q in fuentes_buscadas if q]
+
+    uso = data.get("usage", {})
+    ratelimit = {
+        "requests_restantes": r.headers.get("anthropic-ratelimit-requests-remaining"),
+        "tokens_restantes": r.headers.get("anthropic-ratelimit-tokens-remaining"),
+        "tokens_limite": r.headers.get("anthropic-ratelimit-tokens-limit"),
+        "reset": r.headers.get("anthropic-ratelimit-tokens-reset"),
+    }
+    return texto_final, queries, uso, ratelimit
+
+
+# ==============================================================================
+# 4. INTERFAZ
+# ==============================================================================
+
+st.set_page_config(page_title="Analista Cuantitativo de Apuestas", layout="wide")
+st.title("📊 Analista de Apuesta Única v3.6 (Multi-IA, Multi-Deporte, Motor Elo Interno, Modo por Deporte, Gate de Empate & Esports)")
+
+with st.sidebar:
+    st.header("🔑 Configuración de APIs")
+    api_key = st.secrets.get("ODDS_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("Odds API Key:", type="password")
+
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not gemini_api_key:
+        gemini_api_key = st.text_input("Gemini API Key (Opcional):", type="password")
+
+    anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_api_key:
+        anthropic_api_key = st.text_input("Anthropic (Claude) API Key (Opcional):", type="password")
 
     st.divider()
-    st.caption(
-        f"Blindado {APP_VERSION}. Los collectors dependen de interfaces públicas que pueden cambiar. "
-        "No se utilizan técnicas de evasión de bloqueos ni automatización de apuestas."
+    modo_cobertura_label = st.radio(
+        "Cobertura de bookmakers (The Odds API):",
+        [
+            "Bookmakers fijos (barato en cuota)",
+            "Regiones amplias (más cobertura, MÁS cuota)",
+        ],
+        help=(
+            "'Bookmakers fijos' pide únicamente pinnacle/stake/betonlineag/bet365 — "
+            "si tu plan no incluye alguno de esos, simplemente no aparece, sin aviso "
+            "de la API. 'Regiones amplias' pide todos los bookmakers disponibles en "
+            "tu plan para eu+us+us2+uk+au — trae más cobertura real, pero The Odds "
+            "API cobra más cuota por request mientras más regiones se piden. Revisa "
+            "'📉 Odds API — usados/restantes' abajo después de probarlo."
+        ),
+    )
+    modo_cobertura = (
+        "regiones_amplias" if modo_cobertura_label.startswith("Regiones") else "bookmakers_fijos"
     )
 
+    if "odds_api_uso" in st.session_state:
+        uso = st.session_state["odds_api_uso"]
+        st.caption(f"📉 Odds API — usados: {uso['usados']} · restantes: {uso['restantes']}")
 
-if __name__ == "__main__":
-    main()
+    if "gemini_tokens_acumulados" in st.session_state:
+        g = st.session_state["gemini_tokens_acumulados"]
+        st.caption(
+            f"🧮 Gemini (sesión) — prompt: {g['prompt']:,} · salida: {g['salida']:,} · "
+            f"total: {g['total']:,} tokens"
+        )
+        st.caption("Saldo/crédito real: solo visible en Google AI Studio / Cloud Console.")
+
+    if "claude_tokens_acumulados" in st.session_state:
+        c = st.session_state["claude_tokens_acumulados"]
+        st.caption(
+            f"🧮 Claude (sesión) — entrada: {c['entrada']:,} · salida: {c['salida']:,} · "
+            f"total: {c['total']:,} tokens"
+        )
+        if "claude_ratelimit" in st.session_state:
+            rl = st.session_state["claude_ratelimit"]
+            st.caption(
+                f"⏱️ Ventana de rate-limit — tokens restantes: {rl['tokens_restantes']}/"
+                f"{rl['tokens_limite']} · requests restantes: {rl['requests_restantes']}"
+            )
+        st.caption("Saldo/crédito prepagado real: solo visible en console.anthropic.com → Billing.")
+
+    estado_elo_sidebar = cargar_estado_elo()
+    if estado_elo_sidebar.get("ratings"):
+        with st.expander("🧠 Motor Elo interno — estado actual"):
+            for sport_key, ratings in estado_elo_sidebar["ratings"].items():
+                brier = calcular_brier(estado_elo_sidebar.get("historial_brier", {}).get(sport_key, []))
+                n_muestras = len(estado_elo_sidebar.get("historial_brier", {}).get(sport_key, []))
+                brier_txt = f"{brier:.4f}" if brier is not None else "N/A"
+                st.write(f"**{sport_key}** — {len(ratings)} equipos rateados, "
+                         f"Brier: {brier_txt} ({n_muestras} muestras)")
+
+if api_key:
+    deportes_lista = obtener_deportes_activos(api_key)
+
+    if deportes_lista:
+        opciones_deporte = {"🔥 TODOS LOS DEPORTES ACTIVOS": "ALL"}
+        for dep in deportes_lista:
+            opciones_deporte[f"{dep.get('group')} - {dep.get('title')}"] = dep.get('key')
+
+        seleccion = st.selectbox("Selecciona el deporte o ámbito a analizar:", list(opciones_deporte.keys()))
+        deporte_key_seleccionado = opciones_deporte[seleccion]
+
+        modo_ejecucion = st.radio(
+            "Modo de análisis:",
+            ["Todo en un solo prompt (rápido, menos preciso)", "Separado por deporte (más lento, cobertura completa)"],
+            help=(
+                "'Todo en un prompt' es más barato pero, con muchos eventos, la IA puede quedarse sin "
+                "presupuesto de búsqueda antes de verificar todos — algunos con valor real pueden quedar "
+                "sin analizar. 'Separado por deporte' cuesta más tokens en total pero garantiza que cada "
+                "evento reciba una búsqueda real, y no gasta tokens de IA en eventos ya descartables "
+                "automáticamente (CFL, AFL, NRL, KBO, NPB sin historial, etc.)."
+            ),
+        )
+
+        if st.button("🚀 Generar Prompt y Procesar Datos", type="primary"):
+            with st.spinner("Consultando The Odds API, actualizando motor Elo y procesando pre-filtros..."):
+                datos_acumulados = []
+
+                if deporte_key_seleccionado == "ALL":
+                    progress_bar = st.progress(0)
+                    total_deps = len(deportes_lista)
+                    for idx, dep in enumerate(deportes_lista):
+                        cuotas = obtener_cuotas_api(api_key, dep.get('key'), modo_cobertura=modo_cobertura)
+                        if cuotas:
+                            datos_acumulados.extend(cuotas)
+                        progress_bar.progress((idx + 1) / total_deps)
+                        time.sleep(0.15)  # evita ráfaga -> 429
+                    progress_bar.empty()
+                else:
+                    datos_acumulados = obtener_cuotas_api(api_key, deporte_key_seleccionado, modo_cobertura=modo_cobertura)
+
+                # --- Diagnóstico de liquidez: se construye AQUÍ, a partir de
+                # datos_acumulados ya recibido, en vez de dentro de
+                # obtener_cuotas_api(). Así se genera SIEMPRE, incluso cuando
+                # obtener_cuotas_api sirvió la respuesta desde caché
+                # (@st.cache_data no vuelve a ejecutar el cuerpo de la función
+                # en un cache hit, así que cualquier efecto secundario ahí
+                # dentro — como registrar en session_state — se pierde).
+                # Genérico: cubre TODOS los deportes de la corrida, soccer
+                # incluido, sin necesidad de código específico por deporte. ---
+                diagnostico_bookmakers = []
+                for ev in datos_acumulados:
+                    if not isinstance(ev, dict):
+                        continue
+                    keys = _extraer_bookmaker_keys(ev)
+                    diagnostico_bookmakers.append({
+                        "sport_key": ev.get("sport_key"),
+                        "partido": f"{ev.get('home_team')} vs {ev.get('away_team')}",
+                        "bookmakers_presentes": keys,
+                        "n_bookmakers": len(keys),
+                    })
+                st.session_state["diagnostico_bookmakers_crudo"] = diagnostico_bookmakers
+
+                estado_elo = cargar_estado_elo()
+                sport_keys_presentes = {ev.get("sport_key") for ev in datos_acumulados if isinstance(ev, dict)}
+                for sk in sport_keys_presentes:
+                    base = _buscar_base_registry(sk)
+                    if base.get("usa_elo_interno"):
+                        estado_elo = actualizar_elo_sport(api_key, sk, estado_elo)
+                guardar_estado_elo(estado_elo)
+
+                tz_rd = timezone(timedelta(hours=-4))
+                hora_rd = datetime.now(tz_rd).strftime("%Y-%m-%d %H:%M:%S AST (UTC-4)")
+
+                eventos_filtrados, resumen_filtro = filtrar_y_enriquecer(datos_acumulados, estado_elo)
+                movimientos_pinnacle = registrar_y_calcular_movimientos(eventos_filtrados, deporte_key_seleccionado)
+
+                seccion_movimiento = "SIN SNAPSHOT PREVIO EN ESTA SESIÓN."
+                if movimientos_pinnacle:
+                    lineas_mov = "\n".join(f"- {k}: {v}" for k, v in movimientos_pinnacle.items())
+                    seccion_movimiento = f"MOVIMIENTOS EN PINNACLE DETECTADOS:\n{lineas_mov}"
+
+                st.caption(f"Modo de cobertura usado en esta corrida: **{modo_cobertura_label}**")
+                st.write("### 📌 Resumen de Filtrado Backend")
+                st.info(resumen_filtro)
+
+                # --- Aviso temprano de liquidez sospechosa, visible sin tener
+                # que abrir el expander de diagnóstico ---
+                if eventos_filtrados:
+                    n_con_1_casa = sum(1 for ev in eventos_filtrados if ev.get("_n_casas_reportando", 0) < 2)
+                    if n_con_1_casa == len(eventos_filtrados):
+                        st.warning(
+                            f"⚠️ Los {len(eventos_filtrados)} eventos candidatos tienen "
+                            f"`_n_casas_reportando` < 2 (solo Pinnacle) — TODOS caerán en "
+                            f"'liquidez insuficiente' antes de llegar a validación cruzada. "
+                            f"Revisa el expander '🔍 Diagnóstico de liquidez' en la barra "
+                            f"lateral para ver si esto es un problema de la llamada a la API "
+                            f"o un hecho real de mercado."
+                        )
+
+                    n_soccer_riesgo_empate_alto = sum(
+                        1 for ev in eventos_filtrados
+                        if ev.get("_prob_empate_pinnacle") is not None
+                        and ev["_prob_empate_pinnacle"] >= 0.30
+                    )
+                    if n_soccer_riesgo_empate_alto:
+                        st.info(
+                            f"⚽ {n_soccer_riesgo_empate_alto} evento(s) de fútbol tienen "
+                            f"probabilidad de empate (Pinnacle de-vigged) ≥ 30% — el prompt "
+                            f"instruye a la IA a usar Draw No Bet estimado en vez de "
+                            f"moneyline para esos casos (regla 3c)."
+                        )
+
+                    n_esports = sum(
+                        1 for ev in eventos_filtrados
+                        if (ev.get("sport_key") or "").lower().startswith("esports")
+                    )
+                    if n_esports:
+                        n_esports_baja_liquidez = sum(
+                            1 for ev in eventos_filtrados
+                            if (ev.get("sport_key") or "").lower().startswith("esports")
+                            and ev.get("_n_casas_reportando", 0) < 2
+                        )
+                        st.info(
+                            f"🎮 {n_esports} evento(s) de esports en esta corrida "
+                            f"({n_esports_baja_liquidez} con menos de 2 casas reportando). "
+                            f"Por regla 4 del prompt, esports está EXENTO del gate de "
+                            f"liquidez mínima — no se descartarán por esa causa, aunque "
+                            f"sigan evaluándose normalmente en EV/divergencia/confianza."
+                        )
+
+                if not eventos_filtrados:
+                    st.warning("⚠️ No se encontraron candidatos válidos en el rango 1.40 - 2.00 para los partidos de hoy.")
+                elif modo_ejecucion.startswith("Todo en un solo prompt"):
+                    st.session_state.pop("prompts_por_grupo", None)
+                    st.session_state.pop("resumen_automatico_grupo", None)
+                    prompt_completo = (
+                        f"{SYSTEM_PROMPT_BLINDADO_V3_2}\n\n"
+                        f"==================================================\n"
+                        f"CONTEXTO DE EJECUCIÓN DEL BACKEND\n"
+                        f"==================================================\n"
+                        f"ÁMBITO: {seleccion}\n"
+                        f"HORA CONSULTA (RD/UTC-4): {hora_rd}\n\n"
+                        f"RESUMEN DE PRE-FILTRADO:\n{resumen_filtro}\n\n"
+                        f"{seccion_movimiento}\n\n"
+                        f"INSTRUCCIÓN TÉCNICA: Utiliza directamente los campos `_pinnacle_devig`, "
+                        f"`_pinnacle_last_update`, `_liquidez_backend`, `_dispersion_max_entre_casas`, "
+                        f"`_n_casas_reportando`, `_registry_modelo_secundario` y, para fútbol, "
+                        f"`_prob_empate_pinnacle` / `_draw_no_bet_estimado` (regla 3c). No "
+                        f"recalcules el de-vig ni filtres por rango nuevamente.\n\n"
+                        f"DATOS JSON PRE-FILTRADOS Y ENRIQUECIDOS:\n"
+                        f"{json.dumps(eventos_filtrados, indent=2, ensure_ascii=False)}"
+                    )
+                    st.session_state["prompt_generado"] = prompt_completo
+                    st.success(f"✅ Se consolidaron {len(eventos_filtrados)} eventos aptos para el prompt.")
+                else:
+                    st.session_state.pop("prompt_generado", None)
+                    prompts_por_grupo, resumen_auto = construir_prompts_por_deporte(
+                        eventos_filtrados, seleccion, hora_rd, seccion_movimiento
+                    )
+                    st.session_state["prompts_por_grupo"] = prompts_por_grupo
+                    st.session_state["resumen_automatico_grupo"] = resumen_auto
+                    n_grupos = len(prompts_por_grupo)
+                    n_eventos_ia = sum(
+                        p.count('"partido"') for p in prompts_por_grupo.values()
+                    )
+                    st.success(
+                        f"✅ Se armaron {n_grupos} prompt(s) por familia de deporte "
+                        f"({n_eventos_ia} eventos requieren IA). Los descartes 100% "
+                        f"automáticos se resolvieron sin gastar tokens de IA — revísalos abajo."
+                    )
+                    if resumen_auto:
+                        with st.expander("📋 Descartes automáticos (0 tokens de IA)"):
+                            st.markdown(resumen_auto)
+
+    if "prompt_generado" in st.session_state:
+        st.divider()
+        st.subheader("🤖 Selecciona la IA para ejecutar el Análisis")
+        st.caption("Estos botones abren la web de cada IA — pega el prompt y elige tú el modelo más reciente disponible en cada plataforma.")
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.link_button("🌐 ChatGPT", "https://chatgpt.com", use_container_width=True)
+        with col2:
+            st.link_button("🌐 Claude", "https://claude.ai", use_container_width=True)
+        with col3:
+            st.link_button("🌐 Gemini Web", "https://gemini.google.com", use_container_width=True)
+        with col4:
+            st.link_button("🌐 DeepSeek", "https://chat.deepseek.com", use_container_width=True)
+        with col5:
+            st.link_button("🌐 Copilot", "https://copilot.microsoft.com", use_container_width=True)
+
+        st.write("#### 📋 Prompt Listo para Copiar")
+        st.code(st.session_state["prompt_generado"], language="markdown")
+
+        if gemini_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Gemini API)")
+
+            modelos_disponibles = listar_modelos_gemini(gemini_api_key)
+            if modelos_disponibles:
+                modelo_default = next(
+                    (m for m in modelos_disponibles if "flash" in m and "lite" not in m),
+                    modelos_disponibles[0],
+                )
+                modelo_elegido = st.selectbox(
+                    "Modelo Gemini (lista obtenida en vivo desde la API — siempre actualizada):",
+                    modelos_disponibles,
+                    index=modelos_disponibles.index(modelo_default),
+                )
+                if st.button("🤖 Analizar directamente con Gemini API", type="primary"):
+                    with st.spinner(f"Analizando con {modelo_elegido}..."):
+                        try:
+                            resultado, uso_tokens = llamar_gemini_rest(
+                                gemini_api_key, modelo_elegido, st.session_state["prompt_generado"]
+                            )
+                            st.markdown("### 🏆 Resultado del Análisis")
+                            st.markdown(resultado)
+
+                            prev = st.session_state.get(
+                                "gemini_tokens_acumulados", {"prompt": 0, "salida": 0, "total": 0}
+                            )
+                            prev["prompt"] += uso_tokens.get("promptTokenCount", 0) or 0
+                            prev["salida"] += uso_tokens.get("candidatesTokenCount", 0) or 0
+                            prev["total"] += uso_tokens.get("totalTokenCount", 0) or 0
+                            st.session_state["gemini_tokens_acumulados"] = prev
+                            st.caption(
+                                f"Esta llamada: {uso_tokens.get('promptTokenCount', 0):,} tokens de "
+                                f"entrada · {uso_tokens.get('candidatesTokenCount', 0):,} de salida."
+                            )
+                        except Exception as e:
+                            st.error(f"Error al ejecutar con Gemini API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Gemini.")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecución Directa en App (Claude API — búsqueda forzada)")
+            st.caption(
+                "Esta llamada incluye el tool `web_search` directamente en el request, "
+                "así que Claude SÍ puede buscar en ClubElo/FanGraphs/TennisAbstract "
+                "aunque el toggle de búsqueda en claude.ai estuviera apagado."
+            )
+
+            modelos_claude = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude:
+                modelo_claude_default = next(
+                    (m for m in modelos_claude if "sonnet" in m.lower()), modelos_claude[0]
+                )
+                modelo_claude_elegido = st.selectbox(
+                    "Modelo Claude (lista obtenida en vivo desde la API):",
+                    modelos_claude,
+                    index=modelos_claude.index(modelo_claude_default),
+                )
+                if st.button("🤖 Analizar directamente con Claude API", type="primary"):
+                    with st.spinner(f"Analizando con {modelo_claude_elegido} (con búsqueda web activa)..."):
+                        try:
+                            resultado, queries_buscadas, uso_tokens, ratelimit = llamar_claude_rest(
+                                anthropic_api_key, modelo_claude_elegido, st.session_state["prompt_generado"],
+                                max_tokens=8000,
+                            )
+                            st.markdown("### 🏆 Resultado del Análisis")
+                            st.markdown(resultado)
+                            if queries_buscadas:
+                                with st.expander(f"🔍 Búsquedas web realizadas ({len(queries_buscadas)})"):
+                                    for q in queries_buscadas:
+                                        st.write(f"- {q}")
+                            else:
+                                st.warning(
+                                    "⚠️ Claude no ejecutó ninguna búsqueda web en esta corrida — "
+                                    "revisa el resultado, es posible que haya descartado todo por "
+                                    "falta de datos verificables en vez de fabricarlos."
+                                )
+
+                            entrada_tok = uso_tokens.get("input_tokens", 0) or 0
+                            salida_tok = uso_tokens.get("output_tokens", 0) or 0
+                            prev = st.session_state.get(
+                                "claude_tokens_acumulados", {"entrada": 0, "salida": 0, "total": 0}
+                            )
+                            prev["entrada"] += entrada_tok
+                            prev["salida"] += salida_tok
+                            prev["total"] += entrada_tok + salida_tok
+                            st.session_state["claude_tokens_acumulados"] = prev
+                            st.session_state["claude_ratelimit"] = ratelimit
+                            st.caption(f"Esta llamada: {entrada_tok:,} tokens de entrada · {salida_tok:,} de salida.")
+                        except Exception as e:
+                            st.error(f"Error al ejecutar con Claude API: {e}")
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
+
+    if "prompts_por_grupo" in st.session_state and st.session_state["prompts_por_grupo"]:
+        st.divider()
+        st.subheader("🧩 Modo por deporte — prompts individuales")
+        prompts_por_grupo = st.session_state["prompts_por_grupo"]
+
+        for familia, prompt_texto in prompts_por_grupo.items():
+            with st.expander(f"📋 Prompt — {familia.upper()}"):
+                st.code(prompt_texto, language="markdown")
+
+        if anthropic_api_key:
+            st.divider()
+            st.subheader("⚡ Ejecutar TODOS los grupos con Claude API")
+            st.caption(
+                "Corre una llamada por cada familia de deporte (cada una con su propia "
+                "búsqueda web forzada) y acumula el resultado y el uso de tokens de todas."
+            )
+            modelos_claude_grp = listar_modelos_claude(anthropic_api_key)
+            if modelos_claude_grp:
+                modelo_default_grp = next(
+                    (m for m in modelos_claude_grp if "sonnet" in m.lower()), modelos_claude_grp[0]
+                )
+                modelo_grp_elegido = st.selectbox(
+                    "Modelo Claude para el modo por deporte:",
+                    modelos_claude_grp,
+                    index=modelos_claude_grp.index(modelo_default_grp),
+                    key="modelo_por_deporte",
+                )
+                if st.button("🤖 Analizar TODOS los grupos", type="primary", key="btn_todos_grupos"):
+                    total_entrada, total_salida = 0, 0
+                    for familia, prompt_texto in prompts_por_grupo.items():
+                        with st.spinner(f"Analizando {familia.upper()} (con búsqueda web activa)..."):
+                            try:
+                                resultado, queries, uso_tokens, _ = llamar_claude_rest(
+                                    anthropic_api_key, modelo_grp_elegido, prompt_texto, max_tokens=8000,
+                                )
+                                st.markdown(f"### 🏆 Resultado — {familia.upper()}")
+                                st.markdown(resultado)
+                                if queries:
+                                    with st.expander(f"🔍 Búsquedas realizadas en {familia.upper()} ({len(queries)})"):
+                                        for q in queries:
+                                            st.write(f"- {q}")
+                                entrada_tok = uso_tokens.get("input_tokens", 0) or 0
+                                salida_tok = uso_tokens.get("output_tokens", 0) or 0
+                                total_entrada += entrada_tok
+                                total_salida += salida_tok
+                                st.caption(
+                                    f"{familia.upper()}: {entrada_tok:,} tokens de entrada · "
+                                    f"{salida_tok:,} de salida."
+                                )
+                            except Exception as e:
+                                st.error(f"Error al analizar {familia.upper()}: {e}")
+                    st.divider()
+                    st.success(
+                        f"✅ Corrida por deporte completa — TOTAL: {total_entrada:,} tokens de "
+                        f"entrada · {total_salida:,} de salida · {total_entrada + total_salida:,} tokens "
+                        f"en total (sobre {len(prompts_por_grupo)} grupo(s))."
+                    )
+            else:
+                st.warning("No se pudo obtener la lista de modelos. Verifica la API Key de Anthropic.")
+
+# ==============================================================================
+# 5. DIAGNÓSTICO DE LIQUIDEZ — se renderiza AQUÍ, al final del script, a
+#    propósito.
+#
+#    POR QUÉ AQUÍ Y NO ARRIBA EN LA SIDEBAR JUNTO A LO DEMÁS: Streamlit
+#    ejecuta el archivo completo de arriba a abajo en cada interacción. El
+#    diagnóstico se calcula DENTRO del bloque del botón "Generar Prompt y
+#    Procesar Datos" (sección 4, más arriba). Si este expander se colocara
+#    antes de ese bloque en el archivo — como en la sidebar original — se
+#    dibujaría usando los datos de ANTES del clic, y el diagnóstico recién
+#    calculado quedaría un paso atrás (por eso "desaparecía": en la misma
+#    pasada del clic, se pintaba con la sesión vieja/vacía).
+#
+#    Al colocarlo aquí, después de todo el flujo del botón, Streamlit ya
+#    ejecutó el cálculo y guardó `st.session_state["diagnostico_bookmakers_crudo"]`
+#    ANTES de llegar a este punto — así que siempre muestra el resultado de
+#    la corrida que se acaba de hacer, en la misma pasada, sin necesitar un
+#    segundo clic ni un st.rerun().
+#
+#    `with st.sidebar:` se puede invocar varias veces en un mismo script —
+#    cada vez que se usa, agrega contenido al final de lo que ya hay en la
+#    barra lateral. No reemplaza lo anterior. Esto aplica a TODOS los
+#    deportes de la corrida (soccer incluido), no solo MLB.
+# ==============================================================================
+with st.sidebar:
+    if "diagnostico_bookmakers_crudo" in st.session_state and st.session_state["diagnostico_bookmakers_crudo"]:
+        with st.expander("🔍 Diagnóstico de liquidez (bookmakers crudos por evento)", expanded=True):
+            registro = st.session_state["diagnostico_bookmakers_crudo"]
+            todas_las_keys_vistas = set()
+            for r in registro:
+                todas_las_keys_vistas.update(r["bookmakers_presentes"])
+
+            st.write(
+                f"**{len(registro)} eventos consultados** en la última corrida. "
+                f"Bookmaker keys distintas vistas: "
+                f"{sorted(todas_las_keys_vistas) if todas_las_keys_vistas else '— ninguna —'}"
+            )
+            if todas_las_keys_vistas == {"pinnacle"} or not todas_las_keys_vistas:
+                st.warning(
+                    "⚠️ Solo 'pinnacle' apareció en TODOS los eventos consultados. "
+                    "Esto sugiere que 'stake', 'betonlineag' y/o 'bet365' no están "
+                    "siendo devueltos por tu API key — revisa en "
+                    "https://the-odds-api.com/account si tu plan actual incluye "
+                    "esos bookmakers, y confirma que esos son los 'key' exactos que "
+                    "usa la API (no el nombre visible del libro)."
+                )
+            st.divider()
+            for r in registro[-50:]:  # limita a los últimos 50 para no saturar la UI
+                st.write(
+                    f"- `{r['sport_key']}` — {r['partido']}: "
+                    f"{r['bookmakers_presentes'] if r['bookmakers_presentes'] else '(ninguno)'}"
+                )
+            if st.button("🗑️ Limpiar diagnóstico"):
+                st.session_state["diagnostico_bookmakers_crudo"] = []
+                st.rerun()
